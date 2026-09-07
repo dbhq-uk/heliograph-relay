@@ -1,0 +1,294 @@
+package relay
+
+import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Server is the HTTP surface.
+//
+// Long-poll, not WebSocket. Paseo uses WebSocket because its daemon runs where
+// the user controls the network; a heliograph station runs behind a corporate
+// proxy that may strip an upgrade header, and a transport that fails on those
+// estates fails on exactly the estates this is for.
+type Server struct {
+	store *Store
+	auth  Auth
+	log   *slog.Logger
+
+	// wait is how long a poll holds the line before answering empty. Long
+	// enough that an idle loop is nearly free, short enough that a proxy with
+	// its own idle timeout does not cut it first.
+	wait time.Duration
+
+	mu      sync.Mutex
+	waiters map[string][]chan struct{}
+}
+
+// Auth decides whether a token may act on a route.
+//
+// Deliberately small, and deliberately NOT a security boundary for content. A
+// stolen token yields denial of service and metadata: it can queue rubbish, and
+// it can collect ciphertext it cannot read. It can never produce plaintext or
+// cause a station to run anything, because both of those are settled by
+// signatures this server cannot make.
+//
+// Saying that plainly matters, because "we use scoped tokens" is exactly the
+// sort of claim that gets mistaken for the real protection.
+// Reading and writing are separate methods rather than one method and a
+// type assertion. The first version had the write restriction behind
+// `if sa, ok := auth.(*StaticAuth)`, which meant any other implementation
+// silently skipped it - a station able to queue requests, reachable by
+// swapping in a different Auth. A rule that only applies to one concrete type
+// is not a rule.
+type Auth interface {
+	// AllowRead reports whether this token may collect from this queue.
+	AllowRead(token, estate, station, dir string) bool
+	// AllowWrite reports whether this token may put onto it. Asymmetric on
+	// purpose: a station must not be able to queue a request, even for itself.
+	AllowWrite(token, estate, station, dir string) bool
+}
+
+// StaticAuth is the self-hosted default: one token per estate for each side.
+type StaticAuth struct {
+	// hashed, so a memory dump or a config listing does not hand over a live
+	// credential. Compared in constant time.
+	control map[string][32]byte // estate -> sha256(token)
+	station map[string][32]byte
+}
+
+func NewStaticAuth() *StaticAuth {
+	return &StaticAuth{control: map[string][32]byte{}, station: map[string][32]byte{}}
+}
+
+func (a *StaticAuth) SetControl(estate, token string) {
+	a.control[estate] = sha256.Sum256([]byte(token))
+}
+func (a *StaticAuth) SetStation(estate, token string) {
+	a.station[estate] = sha256.Sum256([]byte(token))
+}
+
+// Allow enforces the two scopes.
+//
+// A control may write requests and read what the station published. A station
+// may read requests and write status and logs. Neither may do the other's half,
+// so a station token stolen from a machine nobody can reach cannot be used to
+// queue a request for any station, including its own.
+func (a *StaticAuth) AllowRead(token, estate, station, dir string) bool {
+	if token == "" || estate == "" || station == "" || !validDir(dir) {
+		return false
+	}
+	got := sha256.Sum256([]byte(token))
+	// Either side may read either queue of its own estate. A control reading
+	// back what it queued is harmless, and refusing it would buy nothing.
+	return match(a.control[estate], got) || match(a.station[estate], got)
+}
+
+// AllowWrite is the one that matters.
+//
+// A station token sits on a machine nobody can reach and cannot be rotated
+// quickly. If it could queue a c2s message, a stolen one would let an attacker
+// send requests to that station - and the station would then refuse them,
+// because they would not carry the control signature. But it would fill the
+// queue, and it would mean the relay's own credential could cause traffic the
+// control never sent. Neither is acceptable when the fix is one method.
+func (a *StaticAuth) AllowWrite(token, estate, station, dir string) bool {
+	if token == "" || estate == "" || station == "" {
+		return false
+	}
+	got := sha256.Sum256([]byte(token))
+	switch dir {
+	case "c2s":
+		return match(a.control[estate], got)
+	case "s2c":
+		return match(a.station[estate], got)
+	}
+	return false
+}
+
+func validDir(d string) bool { return d == "c2s" || d == "s2c" }
+
+func match(want, got [32]byte) bool {
+	var zero [32]byte
+	if want == zero {
+		return false // no token configured for this estate
+	}
+	return subtle.ConstantTimeCompare(want[:], got[:]) == 1
+}
+
+func NewServer(store *Store, auth Auth, log *slog.Logger) *Server {
+	return &Server{
+		store:   store,
+		auth:    auth,
+		log:     log,
+		wait:    25 * time.Second,
+		waiters: map[string][]chan struct{}{},
+	}
+}
+
+func (s *Server) Routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/{estate}/{station}/{dir}", s.put)
+	mux.HandleFunc("GET /v1/{estate}/{station}/{dir}", s.get)
+	mux.HandleFunc("GET /health", s.health)
+	return mux
+}
+
+func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"ok":true}`))
+}
+
+// token reads the bearer credential.
+func token(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if after, ok := strings.CutPrefix(h, "Bearer "); ok {
+		return strings.TrimSpace(after)
+	}
+	return ""
+}
+
+func (s *Server) put(w http.ResponseWriter, r *http.Request) {
+	estate, station, dir := r.PathValue("estate"), r.PathValue("station"), r.PathValue("dir")
+	if !s.auth.AllowWrite(token(r), estate, station, dir) {
+		fail(w, http.StatusUnauthorized, "not authorised to write that direction for this estate")
+		return
+	}
+
+	body := http.MaxBytesReader(w, r.Body, MaxBodyBytes+1024)
+	var in struct {
+		Seq  uint64 `json:"seq"`
+		Body []byte `json:"body"`
+	}
+	if err := json.NewDecoder(body).Decode(&in); err != nil {
+		fail(w, http.StatusBadRequest, "could not read the message")
+		return
+	}
+	err := s.store.Put(Message{
+		Estate: estate, Station: station, Dir: dir, Seq: in.Seq, Body: in.Body,
+	})
+	switch {
+	case errors.Is(err, ErrTooLarge):
+		fail(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	case errors.Is(err, ErrQueueFull):
+		// 429 rather than 500: it is the sender's problem to slow down, and a
+		// 5xx would send them looking for a fault on this side.
+		fail(w, http.StatusTooManyRequests, err.Error())
+		return
+	case errors.Is(err, ErrBadRoute):
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	case err != nil:
+		fail(w, http.StatusInternalServerError, "could not accept the message")
+		return
+	}
+
+	// Metadata only. Never the body, never a token, not even its length in a
+	// way that could be reassembled into content.
+	s.log.Info("put", "estate", estate, "station", station, "dir", dir,
+		"bytes", len(in.Body))
+	s.wake(key(estate, station, dir))
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Server) get(w http.ResponseWriter, r *http.Request) {
+	estate, station, dir := r.PathValue("estate"), r.PathValue("station"), r.PathValue("dir")
+	if !s.auth.AllowRead(token(r), estate, station, dir) {
+		fail(w, http.StatusUnauthorized, "not authorised for this estate")
+		return
+	}
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		limit, _ = strconv.Atoi(v)
+	}
+
+	msgs, err := s.store.Take(estate, station, dir, limit)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(msgs) == 0 && r.URL.Query().Get("wait") != "0" {
+		// Long-poll. An idle station costs one held connection rather than a
+		// request every few seconds, which is what makes a poll interval of
+		// "immediately" affordable on a link somebody is paying for.
+		if s.hold(r, key(estate, station, dir)) {
+			msgs, _ = s.store.Take(estate, station, dir, limit)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if msgs == nil {
+		msgs = []Message{}
+	}
+	_ = json.NewEncoder(w).Encode(msgs)
+}
+
+// hold waits for a message, the timeout, or the client going away.
+func (s *Server) hold(r *http.Request, k string) bool {
+	ch := make(chan struct{}, 1)
+	s.mu.Lock()
+	s.waiters[k] = append(s.waiters[k], ch)
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		w := s.waiters[k]
+		for i, c := range w {
+			if c == ch {
+				s.waiters[k] = append(w[:i], w[i+1:]...)
+				break
+			}
+		}
+		if len(s.waiters[k]) == 0 {
+			delete(s.waiters, k)
+		}
+		s.mu.Unlock()
+	}()
+
+	timer := time.NewTimer(s.wait)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	case <-r.Context().Done():
+		// The client hung up. Returning rather than holding the goroutine is
+		// what stops a flapping link accumulating them.
+		return false
+	}
+}
+
+func (s *Server) wake(k string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ch := range s.waiters[k] {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func fail(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// FingerprintToken is for an operator who has to say which token is configured
+// without saying what it is.
+func FingerprintToken(t string) string {
+	h := sha256.Sum256([]byte(t))
+	return hex.EncodeToString(h[:])[:12]
+}

@@ -1,0 +1,57 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          [ -z "$out" ] || { echo "::error::gofmt would change:"; echo "$out"; exit 1; }
+
+      - run: go vet ./...
+      - run: go test ./... -count=1 -race
+
+      - name: no dependencies at all
+        # This server has none and should never have any. It stores bytes and
+        # moves them; anything it needed a library for would be something it
+        # should not be doing.
+        run: |
+          if [ -f go.sum ]; then
+            echo "::error::go.sum exists. This server has no dependencies by design."
+            exit 1
+          fi
+          echo "no dependencies"
+
+      - name: no cryptography in this repository
+        # The security claim is that there is no key here to leak and no
+        # plaintext to subpoena. sha256 for token comparison is the sole
+        # exception, and it never touches a message body.
+        run: |
+          set -euo pipefail
+          bad=0
+          while read -r hit; do
+            case "$hit" in
+              *crypto/sha256*|*crypto/subtle*) ;;
+              *) echo "::error::cryptographic import in the relay: $hit"; bad=1 ;;
+            esac
+          done < <(grep -rn '"crypto/' --include='*.go' . || true)
+          [ "$bad" = "0" ] || exit 1
+          echo "no cryptography beyond constant-time token comparison"
+
+      - name: the image builds
+        run: docker build -t heliograph-relay:test .
