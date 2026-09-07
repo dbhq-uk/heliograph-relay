@@ -8,6 +8,27 @@ name = "heliograph-relay"
 main = "src/worker.ts"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
+account_id = "691c21cdcf1b3fa4add70cc166e99733"
+
+# The hosted relay. Not a secret: an account id is an identifier, and this
+# deployment being public is a feature of a product whose claim is that the
+# relay cannot read your logs. Hiding how it is deployed would weaken that.
+routes = [{ pattern = "relay.heliograph.dbhq.uk", custom_domain = true }]
+
+# A FOUR-LABEL HOSTNAME NEEDS AN ADVANCED CERTIFICATE, and this will cost you an
+# afternoon if you do not know it. Cloudflare's Universal SSL covers `dbhq.uk`
+# and `*.dbhq.uk` - one level only - so `relay.heliograph.dbhq.uk` is not in it.
+#
+# Adding the custom domain makes Cloudflare create an advanced certificate pack
+# automatically, but it sits in `pending_validation` for a while, and until it
+# issues every request fails with a TLS handshake error rather than anything
+# that names a certificate. It looks exactly like a broken deployment.
+#
+# Check it rather than guessing:
+#   GET /zones/{zone}/ssl/certificate_packs?status=all
+#
+# A three-label name like `heliograph-relay.dbhq.uk` is covered by Universal SSL
+# immediately, and is the answer if you would rather not wait.
 
 # Estate tokens are secrets, not vars. Set with:
 #   wrangler secret put HELIOGRAPH_RELAY_ESTATES
