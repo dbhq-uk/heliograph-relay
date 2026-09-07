@@ -13,22 +13,28 @@ account_id = "691c21cdcf1b3fa4add70cc166e99733"
 # The hosted relay. Not a secret: an account id is an identifier, and this
 # deployment being public is a feature of a product whose claim is that the
 # relay cannot read your logs. Hiding how it is deployed would weaken that.
-routes = [{ pattern = "relay.heliograph.dbhq.uk", custom_domain = true }]
+routes = [{ pattern = "heliograph-relay.dbhq.uk", custom_domain = true }]
 
-# A FOUR-LABEL HOSTNAME NEEDS AN ADVANCED CERTIFICATE, and this will cost you an
-# afternoon if you do not know it. Cloudflare's Universal SSL covers `dbhq.uk`
-# and `*.dbhq.uk` - one level only - so `relay.heliograph.dbhq.uk` is not in it.
+# THREE LABELS, NOT FOUR, AND THAT IS THE WHOLE REASON FOR THE NAME.
 #
-# Adding the custom domain makes Cloudflare create an advanced certificate pack
-# automatically, but it sits in `pending_validation` for a while, and until it
-# issues every request fails with a TLS handshake error rather than anything
-# that names a certificate. It looks exactly like a broken deployment.
+# `relay.heliograph.dbhq.uk` was the first choice and it cannot be given a
+# certificate on this plan. Cloudflare's Universal SSL covers `dbhq.uk` and
+# `*.dbhq.uk` - ONE level of subdomain. A four-label host needs an advanced
+# certificate pack, and advanced packs require Advanced Certificate Manager,
+# which is a paid add-on. Without it the pack Cloudflare creates automatically
+# sits in `pending_validation` forever.
+#
+# It does not fail in a way that says any of that. Every request returns a bare
+# TLS handshake error naming no certificate at all, which reads exactly like a
+# broken deployment when the deployment is fine.
 #
 # Check it rather than guessing:
-#   GET /zones/{zone}/ssl/certificate_packs?status=all
+#   GET /zones/{zone}/ssl/certificate_packs?status=all   -> status, and hosts
+#   GET /zones/{zone}                                    -> plan
 #
-# A three-label name like `heliograph-relay.dbhq.uk` is covered by Universal SSL
-# immediately, and is the answer if you would rather not wait.
+# `heliograph-relay.dbhq.uk` is three labels, covered by Universal SSL, free,
+# and works immediately. The hostname is an API endpoint in a config file
+# rather than branding, so the prettier name was not worth a subscription.
 
 # Estate tokens are secrets, not vars. Set with:
 #   wrangler secret put HELIOGRAPH_RELAY_ESTATES
