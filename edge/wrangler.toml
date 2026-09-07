@@ -1,0 +1,26 @@
+# The relay on Cloudflare's edge.
+#
+# One Durable Object per estate/station/direction. That granularity is not
+# arbitrary: a DO is single-threaded and consistent, and a queue is exactly the
+# thing that wants both. Splitting by route means one busy estate cannot make
+# another wait.
+name = "heliograph-relay"
+main = "src/worker.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Estate tokens are secrets, not vars. Set with:
+#   wrangler secret put HELIOGRAPH_RELAY_ESTATES
+# in the same estate:controlToken:stationToken form the Go server takes, so one
+# format is documented once and works in both places.
+
+[[durable_objects.bindings]]
+name = "QUEUE"
+class_name = "RelayQueue"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayQueue"]
+
+[observability]
+enabled = true

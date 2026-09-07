@@ -55,3 +55,49 @@ jobs:
 
       - name: the image builds
         run: docker build -t heliograph-relay:test .
+
+  edge:
+    name: The Cloudflare Worker passes the same contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: install
+        working-directory: edge
+        run: npm install --no-fund --no-audit
+
+      - name: typecheck
+        working-directory: edge
+        run: npx tsc --noEmit
+
+      - name: start the worker locally
+        working-directory: edge
+        run: |
+          npx wrangler dev --port 8787 --local \
+            --var HELIOGRAPH_RELAY_ESTATES:"e1:ctl:stn,e2:other-ctl:other-stn" \
+            > /tmp/wrangler.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8787/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:8787/health || { cat /tmp/wrangler.log; exit 1; }
+
+      - name: the same conformance suite the Go server runs
+        # Two implementations, one contract. The cost of a second
+        # implementation is drift, and drift is only dangerous when untested.
+        run: go run ./cmd/conformance http://localhost:8787 "cloudflare worker"
+
+      - name: no cryptography in the worker either
+        run: |
+          if grep -rnE "crypto[.]|subtle[.]|WebCrypto|createHash" edge/src/*.ts; then
+            echo "::error::cryptography in the edge relay. It stores ciphertext; it does not touch it."
+            exit 1
+          fi
+          echo "no cryptography at the edge"

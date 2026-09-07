@@ -105,6 +105,46 @@ the reader to the wrong side of the gap.
 It also refuses an estate whose two tokens are identical, since that collapses
 the only scope separation there is.
 
+## Where to run it
+
+Two implementations, one contract. `conformance/` holds it, asserted over HTTP,
+and CI runs it against **both**. An implementation that has not passed it does
+not get deployed.
+
+| | |
+|---|---|
+| **Cloudflare Worker + Durable Object** (`edge/`) | cheapest, global, and the one to reach for |
+| **Go binary or container** (this repository) | anywhere else: a VM, Fly, Cloud Run, or inside a customer's own estate |
+
+### Why a Worker rather than the Go binary in a Container
+
+Cloudflare Containers would run the Go binary unmodified, and it was rejected on
+cost rather than capability. Every long poll holds a request open, which is
+exactly the "idle in memory but unable to hibernate" case that bills Durable
+Object wall-clock time **anyway** - so you would pay the DO cost *and* the
+container cost, plus egress, for the same behaviour.
+
+A Durable Object is also simply the right shape: single-threaded and consistent,
+which is what a queue wants, with one object per estate, station and direction so
+that one busy estate cannot make another wait.
+
+### Why a second implementation is acceptable here
+
+Because this server is trivial. It is a queue with a TTL and a token check, and
+it holds no keys, so the whole of it can still be audited in an afternoon in
+either language. The end-to-end guarantee is untouched: it cannot read a message
+in TypeScript any more than it can in Go.
+
+The real cost is drift, and that is answered the same way heliograph answers it
+everywhere else - one specification, several implementations, and none of them
+trusted until it has passed.
+
+```bash
+cd edge
+npx wrangler secret put HELIOGRAPH_RELAY_ESTATES   # estate:controlToken:stationToken
+npx wrangler deploy
+```
+
 ## Storage
 
 In memory. Deleted on collection, expired after seven days, never written to

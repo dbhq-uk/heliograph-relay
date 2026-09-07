@@ -1,3 +1,5 @@
 /heliograph-relay
 *.exe
 /dist/
+edge/node_modules/
+edge/.wrangler/
