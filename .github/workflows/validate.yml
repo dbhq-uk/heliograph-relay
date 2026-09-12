@@ -75,7 +75,16 @@ jobs:
 
       - name: typecheck
         working-directory: edge
-        run: npx tsc --noEmit
+        run: npm run typecheck
+
+      - name: the storage model, which conformance cannot see
+        # conformance/ is asserted over HTTP, and a storage model is not
+        # observable to a client: memory and Durable Object storage answer every
+        # request in that suite identically. That is how the two implementations
+        # came to disagree behind one README sentence while both passed. These
+        # tests run inside the Workers runtime and read storage directly.
+        working-directory: edge
+        run: npm test
 
       - name: start the worker locally
         working-directory: edge
