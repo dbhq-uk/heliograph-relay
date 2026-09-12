@@ -120,13 +120,74 @@ certificates would be a bigger thing to audit for no gain.
 |---|---|
 | `HELIOGRAPH_RELAY_ADDR` | listen address, default `:8080` |
 | `HELIOGRAPH_RELAY_ESTATES` | `estate:controlToken:stationToken`, comma separated |
+| `HELIOGRAPH_RELAY_AUTHORISER` | a URL that answers authorisation decisions. When set, estates are that service's business and `HELIOGRAPH_RELAY_ESTATES` is not read |
 
-It **refuses to start** with no estates configured. Starting and answering 401
+It **refuses to start** with neither configured. Starting and answering 401
 to everything looks exactly like a credential problem at the far end, and sends
 the reader to the wrong side of the gap.
 
 It also refuses an estate whose two tokens are identical, since that collapses
 the only scope separation there is.
+
+## Bring your own authoriser
+
+Set `HELIOGRAPH_RELAY_AUTHORISER` and the relay asks that URL instead of reading
+tokens from its environment. Accounts, estates, quota, policy and metering
+become whatever answers it, and none of that is added to the code in the path.
+
+```
+POST https://authz.example/decide
+{"credential":"...","estate":"e1","station":"st1","dir":"c2s","op":"write","bytes":812}
+
+200 OK
+{"allow":false,"reason":"wrong-direction","detail":"optional sentence for the caller"}
+```
+
+The request is routing, an operation and a length. **No body, no stream, nothing
+that could be followed to content.** `bytes` is a size, not a sample.
+
+**Only a 200 is a decision.** Anything else - a refused connection, a timeout, a
+500, a 403 about the relay's own credential to the authoriser - is treated as
+the authoriser being unreachable, and the relay answers **503** with
+`"reason":"authoriser-unavailable"`. It does not answer 401. A 401 sends
+somebody to check a token on a machine they cannot reach while the fault is on
+this side, which is the worst hour this transport can cost anybody.
+
+Decisions are cached: 30 seconds for a yes, 5 for a no. A no expires sooner
+because reusing a stale yes keeps a revoked credential alive and reusing a stale
+no keeps a repaired one dead, and neither number removes the trade.
+Unavailability is **not** cached at all, so the relay recovers as soon as the
+authoriser does.
+
+The Worker takes the same variable and speaks the same wire, and CI runs the
+same conformance suite against both, including an outage the suite causes
+itself.
+
+### Why this rather than a fork
+
+The relay a hosted operator deploys is built from this source with nothing
+added, so a customer can compare a hash instead of trusting an operator. That is
+only true while everything a hosted service needs fits behind this seam, which
+is why the seam is here and published rather than kept private. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Every refusal says why
+
+Beside the sentence, in a field a program can read.
+
+| `reason` | status | |
+|---|---|---|
+| `no-credential` | 401 | no bearer token |
+| `bad-credential` | 401 | the token is not one this relay knows |
+| `wrong-direction` | 401 | a good token used for the other side's half |
+| `authoriser-unavailable` | 503 | **our** fault, not yours |
+| `bad-route` | 400 | not an estate, a station and `c2s` or `s2c` |
+| `unreadable-request` | 400 | the envelope would not parse |
+| `too-large` | 413 | over `MaxBodyBytes` |
+| `queue-full` | 429 | the recipient has stopped collecting |
+
+The sentence is for a person and the reason is for a program, because a client
+that has to match on English prose breaks when the prose improves.
 
 ## Where to run it
 

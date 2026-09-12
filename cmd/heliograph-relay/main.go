@@ -26,16 +26,19 @@ var version = "dev"
 // newServer exists only to carry the build's version into the server, so
 // /version reports the binary that is actually answering rather than a
 // constant somebody forgot to update.
-func newServer(store *relay.Store, auth relay.Auth, log *slog.Logger) *relay.Server {
-	s := relay.NewServer(store, auth, log)
+func newServer(store *relay.Store, auth relay.Authoriser, log *slog.Logger) *relay.Server {
+	s := relay.NewAuthorisingServer(store, auth, log)
 	s.Version = version
 	return s
 }
 
 const usage = `heliograph-relay - stores and forwards ciphertext it cannot read
 
-  HELIOGRAPH_RELAY_ADDR      listen address           (default :8080)
-  HELIOGRAPH_RELAY_ESTATES   estate:controlToken:stationToken, comma separated
+  HELIOGRAPH_RELAY_ADDR        listen address         (default :8080)
+  HELIOGRAPH_RELAY_ESTATES     estate:controlToken:stationToken, comma separated
+  HELIOGRAPH_RELAY_AUTHORISER  a URL that answers authorisation decisions.
+                               When set, estates are that service's business
+                               and HELIOGRAPH_RELAY_ESTATES is not read
 
 Example:
 
@@ -44,6 +47,15 @@ Example:
 Generate tokens with something that is actually random:
 
   head -c 32 /dev/urandom | base64
+
+Behind your own authoriser:
+
+  HELIOGRAPH_RELAY_AUTHORISER=https://authz.example/decide heliograph-relay
+
+It POSTs {credential, estate, station, dir, op, bytes} and expects
+{"allow": bool, "reason": string}. Only 200 is a decision: anything else is
+treated as the authoriser being unreachable, and the relay answers 503 rather
+than 401, so a reader is not sent to check a token when the fault is here.
 `
 
 func main() {
@@ -59,13 +71,29 @@ func main() {
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	auth := relay.NewStaticAuth()
 	spec := os.Getenv("HELIOGRAPH_RELAY_ESTATES")
+	authoriser := strings.TrimSpace(os.Getenv("HELIOGRAPH_RELAY_AUTHORISER"))
+
+	if authoriser != "" {
+		// Somebody else's directory decides. This is how the hosted service
+		// adds tenants, estates, quota and billing without adding a line to the
+		// binary in the path, and it is here rather than kept private so that a
+		// self-hoster with their own authoriser is not being handed a
+		// hollowed-out version of the transport.
+		if strings.TrimSpace(spec) != "" {
+			log.Warn("HELIOGRAPH_RELAY_ESTATES is set and will not be read, because HELIOGRAPH_RELAY_AUTHORISER is set. Two sources of truth for the same question is a configuration nobody can reason about",
+				"authoriser", authoriser)
+		}
+		serve(relay.NewRemoteAuth(authoriser), log, 0)
+		return
+	}
+
+	auth := relay.NewStaticAuth()
 	if strings.TrimSpace(spec) == "" {
 		// Refusing to start beats starting with no estates and answering 401 to
 		// everything, which looks exactly like a credential problem at the far
 		// end and sends the reader to the wrong side of the gap.
-		fmt.Fprint(os.Stderr, "heliograph-relay: HELIOGRAPH_RELAY_ESTATES is empty, so no client could ever authenticate.\n\n")
+		fmt.Fprint(os.Stderr, "heliograph-relay: neither HELIOGRAPH_RELAY_ESTATES nor HELIOGRAPH_RELAY_AUTHORISER is set, so no client could ever authenticate.\n\n")
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
@@ -91,7 +119,11 @@ func main() {
 			"station", relay.FingerprintToken(parts[2]))
 		n++
 	}
+	serve(relay.FromAuth(auth), log, n)
+}
 
+// serve runs the server until a signal, whichever authoriser it was handed.
+func serve(auth relay.Authoriser, log *slog.Logger, estates int) {
 	store := relay.NewStore()
 	go func() {
 		for range time.Tick(time.Hour) {
@@ -116,7 +148,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info("listening", "addr", addr, "estates", n, "version", version)
+		log.Info("listening", "addr", addr, "estates", estates, "version", version)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("serve", "err", err)
 			os.Exit(1)

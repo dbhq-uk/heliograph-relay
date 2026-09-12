@@ -61,6 +61,27 @@ type Target struct {
 	OtherEstate  string
 	OtherControl string
 	Client       *http.Client
+
+	// ControlPlane, when set, takes the relay's authoriser away and returns a
+	// function that puts it back.
+	//
+	// A relay under test cannot be asked to break its own authoriser over HTTP,
+	// and the distinction between "your credential is wrong" and "I could not
+	// ask" is only assertable if the suite can cause the outage. So the harness
+	// supplies the lever and this package says what must be true while it is
+	// pulled. Leaving it nil skips the section and says so, rather than
+	// reporting a pass nobody earned.
+	ControlPlane func() (restore func())
+}
+
+// refusal is what a relay says when it says no.
+//
+// Two fields, on purpose: the sentence is for a person and the reason is for a
+// program. A client that has to match on English prose breaks when the prose
+// improves.
+type refusal struct {
+	Error  string `json:"error"`
+	Reason string `json:"reason"`
 }
 
 // Result is one assertion.
@@ -108,12 +129,20 @@ func (t Target) do(method, url, tok string, body []byte) (*http.Response, []byte
 }
 
 func (t Target) put(estate, station, dir, tok string, seq uint64, body []byte) (int, error) {
+	code, _, err := t.putR(estate, station, dir, tok, seq, body)
+	return code, err
+}
+
+// putR is put, and also the refusal, for the assertions about WHY.
+func (t Target) putR(estate, station, dir, tok string, seq uint64, body []byte) (int, refusal, error) {
 	payload, _ := json.Marshal(map[string]any{"seq": seq, "body": body})
-	resp, _, err := t.do("POST", t.url(estate, station, dir, ""), tok, payload)
+	resp, b, err := t.do("POST", t.url(estate, station, dir, ""), tok, payload)
 	if err != nil {
-		return 0, err
+		return 0, refusal{}, err
 	}
-	return resp.StatusCode, nil
+	var why refusal
+	_ = json.Unmarshal(b, &why)
+	return resp.StatusCode, why, nil
 }
 
 type msg struct {
@@ -239,6 +268,70 @@ func Run(t Target) []Result {
 
 	code, _ = t.put(t.Estate, uniq, "c2s", "definitely-not-the-token", 3, []byte("x"))
 	ok("a put with a wrong token is refused", code == 401, fmt.Sprintf("got %d", code))
+
+	// --- every refusal says why, in a field a program can read -------------
+	// A relay that answers only a status code makes the caller guess, and the
+	// guess an operator makes about a 401 is "the token is wrong" - which sends
+	// them to a machine they cannot reach even when the fault is ours.
+	{
+		_, none, _ := t.putR(t.Estate, uniq, "c2s", "", 3, []byte("x"))
+		_, wrong, _ := t.putR(t.Estate, uniq, "c2s", "definitely-not-the-token", 3, []byte("x"))
+		_, dirn, _ := t.putR(t.Estate, uniq, "c2s", t.StationTok, 3, []byte("x"))
+
+		ok("a refusal names a machine-readable reason",
+			none.Reason != "" && wrong.Reason != "" && dirn.Reason != "",
+			fmt.Sprintf("none=%q wrong=%q direction=%q", none.Reason, wrong.Reason, dirn.Reason))
+		ok("a missing credential and a wrong one are told apart",
+			none.Reason != wrong.Reason,
+			fmt.Sprintf("both said %q", none.Reason))
+		// A station credential writing c2s is a good credential used wrongly.
+		// Reporting it as a bad credential is what gets a station rotated on a
+		// machine nobody can reach, for nothing.
+		ok("a good credential in the wrong direction is not reported as a bad one",
+			dirn.Reason != wrong.Reason,
+			fmt.Sprintf("both said %q", dirn.Reason))
+		ok("a refusal still carries a sentence for a person",
+			none.Error != "" && wrong.Error != "" && dirn.Error != "",
+			fmt.Sprintf("none=%q wrong=%q direction=%q", none.Error, wrong.Error, dirn.Error))
+	}
+
+	// --- the authoriser is down, which is not the same as a bad credential --
+	// heliograph-io/heliograph-cloud#7. The worst failure this product has is a
+	// management-plane outage reported as a credential problem, because the
+	// person who reads a 401 goes to the far side of the gap and the fault is
+	// on this side.
+	if t.ControlPlane != nil {
+		// A route decided while the authoriser was up.
+		warm := uniq + "-warm"
+		code, _ = t.put(t.Estate, warm, "c2s", t.Control, 1, []byte("before"))
+		ok("the authoriser answers before the outage", code == 202, fmt.Sprintf("got %d", code))
+
+		restore := t.ControlPlane()
+
+		code, why, _ := t.putR(t.Estate, warm, "c2s", t.Control, 2, []byte("during"))
+		ok("a decision made before the outage still works during it", code == 202,
+			fmt.Sprintf("got %d %q", code, why.Reason))
+
+		// A route that was never decided cannot be answered from anything held
+		// locally, so this is the outage path itself.
+		cold := uniq + "-cold"
+		code, why, _ = t.putR(t.Estate, cold, "c2s", t.Control, 1, []byte("x"))
+		ok("an outage does NOT answer 401", code != 401, fmt.Sprintf("got %d %q", code, why.Reason))
+		ok("an outage answers 503", code == 503, fmt.Sprintf("got %d %q", code, why.Reason))
+		ok("an outage names itself as the authoriser being unreachable",
+			why.Reason == "authoriser-unavailable", fmt.Sprintf("reason=%q", why.Reason))
+
+		restore()
+
+		// And it recovers. An outage cached is an outage extended past its own
+		// end, which is the opposite of what a cache is for.
+		code, why, _ = t.putR(t.Estate, cold, "c2s", t.Control, 1, []byte("after"))
+		ok("the relay works again as soon as the authoriser does", code == 202,
+			fmt.Sprintf("got %d %q", code, why.Reason))
+	} else {
+		ok("SKIPPED: the authoriser outage section needs a lever this harness did not supply",
+			true, "")
+	}
 
 	// --- estates are isolated --------------------------------------------
 	if t.OtherEstate != "" {

@@ -103,6 +103,31 @@ jobs:
         # implementation is drift, and drift is only dangerous when untested.
         run: go run ./cmd/conformance http://localhost:8787 "cloudflare worker"
 
+      - name: start a second worker behind a remote authoriser
+        # The seam the hosted service lives behind. A seam nobody has run the
+        # contract through is a seam that will drift from the one everybody
+        # runs, so the Worker gets the same treatment as the Go server.
+        working-directory: edge
+        run: |
+          npx wrangler dev --port 8788 --inspector-port 9230 --local \
+            --var HELIOGRAPH_RELAY_AUTHORISER:"http://127.0.0.1:9797/decide" \
+            > /tmp/wrangler-authz.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8788/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:8788/health || { cat /tmp/wrangler-authz.log; exit 1; }
+
+      - name: a control-plane outage is not a bad credential, at the edge too
+        # The suite runs the control plane itself, so it can take it away. The
+        # worst failure this product has is a management-plane outage reported
+        # as a credential problem: the person who reads a 401 goes to the far
+        # side of the gap, and the fault is on this side.
+        # heliograph-io/heliograph-cloud#7
+        env:
+          HELIOGRAPH_CONF_AUTHORISER: 127.0.0.1:9797
+        run: go run ./cmd/conformance http://localhost:8788 "cloudflare worker behind a remote authoriser"
+
       - name: no cryptography in the worker either
         run: |
           if grep -rnE "crypto[.]|subtle[.]|WebCrypto|createHash" edge/src/*.ts; then
