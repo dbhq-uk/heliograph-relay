@@ -51,21 +51,17 @@ function landingHTML(version: string): string {
 <meta name="robots" content="noindex">
 <title>heliograph relay</title>
 <style>
- body{background:#111;color:#eee;font:16px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:2rem 1.25rem;max-width:38rem}
- h1{font-size:1.1rem;margin:0 0 1rem;font-weight:600}
- p{margin:0 0 1rem}
- dt{color:#8b8b8b;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;margin-top:1rem}
- dd{margin:.15rem 0 0;word-break:break-all}
- a{color:#6cf}
+ body{background:#111;color:#eee;font:15px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:2.5rem 1.25rem;max-width:34rem}
+ h1{font-size:1rem;margin:0;font-weight:600}
+ p{color:#8b8b8b;margin:.25rem 0 1.75rem}
+ a{color:#6cf;display:block}
+ code{color:#8b8b8b;word-break:break-all}
 </style></head><body>
 <h1>heliograph relay</h1>
-<p>${WHAT_IT_IS}</p>
-<p>This is an API endpoint. There is nothing to use here by hand.</p>
-<dl>
- <dt>version</dt><dd>${version}</dd>
- <dt>source</dt><dd><a href="${SOURCE_URL}">${SOURCE_URL}</a></dd>
- <dt>documentation</dt><dd><a href="${DOCS_URL}">${DOCS_URL}</a></dd>
-</dl>
+<p>Stores and forwards ciphertext it cannot read.</p>
+<code>${version}</code>
+<a href="${SOURCE_URL}">source</a>
+<a href="${DOCS_URL}">docs</a>
 </body></html>`;
 }
 
