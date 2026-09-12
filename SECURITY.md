@@ -1,0 +1,103 @@
+# Security
+
+## Reporting a vulnerability
+
+Email <dan@dbhq.uk> rather than opening a public issue. Include what you found,
+how to reproduce it, and what an attacker could do with it. You will get a first
+response within 48 hours.
+
+## What happens next
+
+The timeline is Google Project Zero's, because it is the one the industry already
+recognises and there is no reason to invent another.
+
+A report is **urgent** when there is a credible way to exploit it today *and* the
+damage would be material. Both, not either.
+
+| | fixed within | advisory published |
+|---|---|---|
+| **urgent** | 7 days | 30 days after the fix, and never later than day 60 |
+| **everything else** | 90 days | 30 days after the fix, and never later than day 120 |
+
+**The 30 days between the fix and the advisory is for you.** It is there so an
+operator can upgrade before the details are public. This runs in estates with
+slow change control, and publishing the day a patch exists would expose exactly
+the people the patch was for.
+
+If something is still unfixed when its deadline arrives, a **defensive notice**
+goes out anyway: affected versions, what it lets an attacker do, how to spot it
+and how to mitigate it, without a working exploit.
+
+**These are commitments rather than aspirations.** If one is missed, the advisory
+says so and says why.
+
+Every confirmed finding is published once its fix has shipped, **in full rather
+than summarised**, including the reasoning about why the old design was the wrong
+shape. Where something is removed the advisory names the category, so you can
+tell a redaction from an argument that was never made.
+
+**Nobody is ahead of you in the queue.** Hosted users get no earlier warning of a
+relay vulnerability than self-hosters do.
+
+The same policy, in full, is in
+[heliograph's `SECURITY.md`](https://github.com/dbhq-uk/heliograph/blob/main/SECURITY.md).
+
+## What this server is, and what it is not
+
+The relay stores and forwards **opaque ciphertext** between a control and a
+station. It holds no keys, does no crypto, and never sees plaintext. That is the
+whole design, and the file that has to be true for it is small enough to read in
+one sitting: `relay.go` plus `server.go`.
+
+This matters more than usual, because the relay is the one component that a
+compromise would put in the middle of somebody's estate.
+
+### Tokens are not the security boundary for content
+
+The bearer tokens exist for routing, rate limiting and abuse control. **A stolen
+token yields denial of service and metadata, never content and never execution.**
+
+Content is protected by the sealing layer, which the relay has no part in. A
+request is signed by the control's Ed25519 key and verified at the station. The
+relay cannot forge one, because it does not hold the signing half.
+
+**But "not the security boundary" is only true of content.** Collection,
+availability, tenant isolation and metadata all rest on the token, and a
+destructive collection means a stolen token can cause silent loss rather than
+silent disclosure. Anybody reasoning about this should read that sentence with
+its qualifier attached.
+
+### The two scopes are asymmetric on purpose
+
+A **station** token may read requests and write status and logs. A **control**
+token may write requests and read logs. Neither may do the other's half, so a
+station token lifted from a machine nobody can reach cannot be used to queue a
+request, even for its own station. `server.go` is where that is enforced and why.
+
+An estate whose two tokens are identical is refused, because that collapses the
+only scope separation there is. The Go server refuses to start and names the
+estate (`cmd/heliograph-relay/main.go:70-75`). The Worker skips that estate
+(`edge/src/worker.ts:60`), which fails closed but is harder to diagnose.
+
+### Storage
+
+Held only until collected, or seven days, whichever comes first. See the Storage
+section of the [README](README.md) for what each implementation actually does,
+including where they differ, because they do.
+
+### What a compromised relay could still do
+
+Stated rather than implied, because "it cannot read your logs" is the interesting
+half and not the whole answer. A relay that was fully compromised could:
+
+- **deny service**, by dropping, delaying or refusing messages
+- **see metadata**: which estates and stations are active, when, how often, and
+  how large their messages are
+- **replay** a message it previously accepted, which the station's replay counter
+  is there to catch
+
+It could **not** read a message, forge one a station will accept, or cause a
+station to run anything, because all three need key material it does not have.
+
+If you need the metadata half covered too, run your own. That is why it is one
+container with no keys and no state worth backing up.
