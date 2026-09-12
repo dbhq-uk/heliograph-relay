@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"log/slog"
 	"net/http"
@@ -33,6 +34,11 @@ type Server struct {
 
 	mu      sync.Mutex
 	waiters map[string][]chan struct{}
+
+	// Version is what this build reports at /version and /. Empty means
+	// nobody set it, which is itself worth reporting rather than hiding:
+	// an operator who cannot tell what is deployed should be told so.
+	Version string
 }
 
 // Auth decides whether a token may act on a route.
@@ -141,12 +147,93 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /v1/{estate}/{station}/{dir}", s.put)
 	mux.HandleFunc("GET /v1/{estate}/{station}/{dir}", s.get)
 	mux.HandleFunc("GET /health", s.health)
+	mux.HandleFunc("GET /version", s.version)
+	mux.HandleFunc("GET /{$}", s.root)
 	return mux
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true}`))
+}
+
+// reportedVersion never returns an empty string. A build with no version
+// stamped says so, because "unknown" is a true answer an operator can act on
+// and a blank field reads as a bug in the client asking.
+func (s *Server) reportedVersion() string {
+	if s.Version == "" {
+		return "unknown"
+	}
+	return s.Version
+}
+
+// version exists so that "the relay you are talking to is the relay you read"
+// is checkable rather than asserted. Without it nobody, including whoever
+// deployed it, can tell which commit is answering.
+func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]string{
+		"service":        "heliograph-relay",
+		"implementation": "go",
+		"version":        s.reportedVersion(),
+		"source":         sourceURL,
+	})
+}
+
+// root answers the one request a human makes. Somebody who found this
+// hostname in a config file and pasted it into a browser used to get
+// {"error":"no such route"} - and because that carried a JSON content type,
+// mobile Safari offered it as a 25-byte download rather than showing it.
+//
+// So a browser gets a page and everything else gets JSON. The JSON half
+// matters: / is also how a check reads the version.
+func (s *Server) root(w http.ResponseWriter, r *http.Request) {
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprintf(w, landingHTML, whatItIs, s.reportedVersion(), sourceURL, sourceURL, docsURL, docsURL)
+		return
+	}
+	writeJSON(w, map[string]string{
+		"service":        "heliograph-relay",
+		"implementation": "go",
+		"version":        s.reportedVersion(),
+		"what":           whatItIs,
+		"source":         sourceURL,
+		"docs":           docsURL,
+	})
+}
+
+const (
+	whatItIs  = "Stores and forwards opaque ciphertext between a control and a station. It holds no keys, does no crypto, and never sees plaintext."
+	sourceURL = "https://github.com/dbhq-uk/heliograph-relay"
+	docsURL   = "https://heliograph.dbhq.uk/relay"
+
+	landingHTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>heliograph relay</title>
+<style>
+ body{background:#111;color:#eee;font:16px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:2rem 1.25rem;max-width:38rem}
+ h1{font-size:1.1rem;margin:0 0 1rem;font-weight:600}
+ p{margin:0 0 1rem}
+ dt{color:#8b8b8b;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;margin-top:1rem}
+ dd{margin:.15rem 0 0;word-break:break-all}
+ a{color:#6cf}
+</style></head><body>
+<h1>heliograph relay</h1>
+<p>%s</p>
+<p>This is an API endpoint. There is nothing to use here by hand.</p>
+<dl>
+ <dt>version</dt><dd>%s</dd>
+ <dt>source</dt><dd><a href="%s">%s</a></dd>
+ <dt>documentation</dt><dd><a href="%s">%s</a></dd>
+</dl>
+</body></html>`
+)
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // token reads the bearer credential.

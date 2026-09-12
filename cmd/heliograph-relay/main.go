@@ -23,6 +23,15 @@ import (
 
 var version = "dev"
 
+// newServer exists only to carry the build's version into the server, so
+// /version reports the binary that is actually answering rather than a
+// constant somebody forgot to update.
+func newServer(store *relay.Store, auth relay.Auth, log *slog.Logger) *relay.Server {
+	s := relay.NewServer(store, auth, log)
+	s.Version = version
+	return s
+}
+
 const usage = `heliograph-relay - stores and forwards ciphertext it cannot read
 
   HELIOGRAPH_RELAY_ADDR      listen address           (default :8080)
@@ -98,7 +107,7 @@ func main() {
 	}
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: relay.NewServer(store, auth, log).Routes(),
+		Handler: newServer(store, auth, log).Routes(),
 		// Generous, because a long poll holds the line by design. The read
 		// header timeout is the one that matters against a slow-loris.
 		ReadHeaderTimeout: 10 * time.Second,
