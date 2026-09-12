@@ -125,6 +125,35 @@ func Run(t Target) []Result {
 	ok("health answers without a token", err == nil && resp != nil && resp.StatusCode == 200,
 		fmt.Sprintf("err=%v", err))
 
+	// --- identity, and the two endpoints a human reaches for -------------
+	// Both are unauthenticated on purpose. "The relay you are talking to is
+	// the relay you read" is not checkable if you need a credential to ask
+	// which relay it is, and the answer reveals nothing a reader of the
+	// public source does not already have.
+	base := strings.TrimRight(t.BaseURL, "/")
+	for _, path := range []string{"/", "/version"} {
+		resp, body, err := t.do("GET", base+path, "", nil)
+		got := struct {
+			Service        string `json:"service"`
+			Implementation string `json:"implementation"`
+			Version        string `json:"version"`
+			Source         string `json:"source"`
+		}{}
+		parsed := err == nil && json.Unmarshal(body, &got) == nil
+		ok(path+" answers without a token", err == nil && resp != nil && resp.StatusCode == 200,
+			fmt.Sprintf("err=%v", err))
+		ok(path+" names the service and the implementation",
+			parsed && got.Service == "heliograph-relay" && got.Implementation != "",
+			fmt.Sprintf("service=%q implementation=%q", got.Service, got.Implementation))
+		// Never blank. A build nobody stamped must say "unknown" rather than
+		// return an empty string, because a blank field reads as a broken
+		// client where "unknown" is a true answer somebody can act on.
+		ok(path+" reports a version that is never blank", parsed && got.Version != "",
+			fmt.Sprintf("version=%q", got.Version))
+		ok(path+" points at the source", parsed && got.Source != "",
+			fmt.Sprintf("source=%q", got.Source))
+	}
+
 	// --- a message goes in and comes back unchanged ----------------------
 	// Bytes that are not valid UTF-8 and not valid JSON, because the body is
 	// ciphertext and the relay must never interpret it.

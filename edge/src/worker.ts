@@ -21,6 +21,25 @@ export interface Env {
   QUEUE: DurableObjectNamespace;
   /** estate:controlToken:stationToken, comma separated. A secret, not a var. */
   HELIOGRAPH_RELAY_ESTATES: string;
+  /**
+   * The commit this was deployed from. A var rather than a secret, because the
+   * entire point is that anybody can read it and compare it against `main`.
+   * Set at deploy: `wrangler deploy --var VERSION:$(git rev-parse HEAD)`.
+   */
+  VERSION?: string;
+}
+
+const WHAT_IT_IS =
+  "Stores and forwards opaque ciphertext between a control and a station. " +
+  "It holds no keys, does no crypto, and never sees plaintext.";
+const SOURCE_URL = "https://github.com/dbhq-uk/heliograph-relay";
+const DOCS_URL = "https://heliograph.dbhq.uk/relay";
+
+// Never an empty string. A deploy with no version stamped says "unknown",
+// which is a true answer an operator can act on, where a blank field reads as
+// a bug in whatever asked.
+function reportedVersion(env: Env): string {
+  return env.VERSION && env.VERSION !== "" ? env.VERSION : "unknown";
 }
 
 const MAX_BODY_BYTES = 8 << 20; // 8 MiB, as the Go server
@@ -188,6 +207,32 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     if (url.pathname === "/health") return json({ ok: true });
+
+    // /version exists so that "the relay you are talking to is the relay you
+    // read" is checkable rather than asserted. Without it nobody, including
+    // whoever deployed it, can tell which commit is answering.
+    if (url.pathname === "/version") {
+      return json({
+        service: "heliograph-relay",
+        implementation: "worker",
+        version: reportedVersion(env),
+        source: SOURCE_URL,
+      });
+    }
+
+    // The one request a human makes. Somebody who found this hostname in a
+    // config file and pasted it into a browser used to get a bare 404, which
+    // tells them nothing about what they have found or whether it is theirs.
+    if (url.pathname === "/") {
+      return json({
+        service: "heliograph-relay",
+        implementation: "worker",
+        version: reportedVersion(env),
+        what: WHAT_IT_IS,
+        source: SOURCE_URL,
+        docs: DOCS_URL,
+      });
+    }
 
     // /v1/{estate}/{station}/{dir}
     const parts = url.pathname.split("/").filter(Boolean);

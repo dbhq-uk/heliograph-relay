@@ -33,6 +33,11 @@ type Server struct {
 
 	mu      sync.Mutex
 	waiters map[string][]chan struct{}
+
+	// Version is what this build reports at /version and /. Empty means
+	// nobody set it, which is itself worth reporting rather than hiding:
+	// an operator who cannot tell what is deployed should be told so.
+	Version string
 }
 
 // Auth decides whether a token may act on a route.
@@ -141,12 +146,62 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /v1/{estate}/{station}/{dir}", s.put)
 	mux.HandleFunc("GET /v1/{estate}/{station}/{dir}", s.get)
 	mux.HandleFunc("GET /health", s.health)
+	mux.HandleFunc("GET /version", s.version)
+	mux.HandleFunc("GET /{$}", s.root)
 	return mux
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true}`))
+}
+
+// reportedVersion never returns an empty string. A build with no version
+// stamped says so, because "unknown" is a true answer an operator can act on
+// and a blank field reads as a bug in the client asking.
+func (s *Server) reportedVersion() string {
+	if s.Version == "" {
+		return "unknown"
+	}
+	return s.Version
+}
+
+// version exists so that "the relay you are talking to is the relay you read"
+// is checkable rather than asserted. Without it nobody, including whoever
+// deployed it, can tell which commit is answering.
+func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]string{
+		"service":        "heliograph-relay",
+		"implementation": "go",
+		"version":        s.reportedVersion(),
+		"source":         sourceURL,
+	})
+}
+
+// root answers the one request a human makes. Somebody who found this
+// hostname in a config file and pasted it into a browser used to get a bare
+// 404, which tells them nothing about what they have found or whether it is
+// theirs.
+func (s *Server) root(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]string{
+		"service":        "heliograph-relay",
+		"implementation": "go",
+		"version":        s.reportedVersion(),
+		"what":           whatItIs,
+		"source":         sourceURL,
+		"docs":           docsURL,
+	})
+}
+
+const (
+	whatItIs  = "Stores and forwards opaque ciphertext between a control and a station. It holds no keys, does no crypto, and never sees plaintext."
+	sourceURL = "https://github.com/dbhq-uk/heliograph-relay"
+	docsURL   = "https://heliograph.dbhq.uk/relay"
+)
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // token reads the bearer credential.

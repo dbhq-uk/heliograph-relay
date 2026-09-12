@@ -142,8 +142,41 @@ trusted until it has passed.
 ```bash
 cd edge
 npx wrangler secret put HELIOGRAPH_RELAY_ESTATES   # estate:controlToken:stationToken
-npx wrangler deploy
+npx wrangler deploy --var VERSION:"$(git rev-parse HEAD)"
 ```
+
+**Do not drop the `--var`.** Without it the deployment answers
+`{"version":"unknown"}` and nobody, including whoever deployed it, can tell which
+commit is running. A relay whose proposition is that you can read it before you
+run it ought to be able to say which "it" you are reading.
+
+## Identity
+
+Two endpoints, neither of which needs a token, because "the relay you are talking
+to is the relay you read" is not checkable if you need a credential to ask which
+relay it is.
+
+```bash
+curl https://heliograph-relay.dbhq.uk/version
+{"service":"heliograph-relay","implementation":"worker","version":"<commit>",...}
+```
+
+`GET /version` gives the service, which implementation is answering, the commit
+it was built from, and where the source is. `GET /` gives the same plus a
+sentence on what this server is and a link to the documentation, because
+somebody who found the hostname in a config file and pasted it into a browser
+deserves better than a bare 404.
+
+**`version` is never an empty string.** An unstamped build reports `unknown`,
+which is a true answer somebody can act on, where a blank field reads as a fault
+in whatever asked.
+
+**What this does not yet do**, said plainly because the gap matters: a version
+string is a claim by the deployment about itself. It is not provenance. It does
+not prove the running code was built from that commit, and nothing here signs an
+artefact or verifies one before it is promoted. That is open work, and until it
+lands the honest statement is "the relay reports which commit it believes it is",
+not "the relay is provably the source you read".
 
 ## Storage
 
@@ -201,12 +234,26 @@ actually kept.
 ```
 POST /v1/{estate}/{station}/{dir}    queue a message   (dir: c2s | s2c)
 GET  /v1/{estate}/{station}/{dir}    collect, long-polling by default
-GET  /health
+GET  /health                         liveness, no token
+GET  /version                        which commit is answering, no token
+GET  /                               the same, plus what this server is
 ```
 
-`GET` holds the connection for up to 25 seconds waiting for a message, so an
-idle station costs one held connection rather than a request every few seconds.
-Add `?wait=0` to return immediately.
+`GET` on a queue holds the connection for up to 25 seconds waiting for a
+message. Add `?wait=0` to return immediately.
+
+**The long poll is available; the bash station does not use it.** It fetches
+`?wait=0` on an interval that defaults to five seconds. This README used to say
+"an idle station costs one held connection rather than a request every few
+seconds", which is the opposite of what the shipped station does, and the
+sentence was being quoted as the basis for cost reasoning. Corrected here rather
+than edited away, because a wrong reason is worse than no reason once somebody
+has built on it.
+
+What an idle station actually costs has not been measured, and the two shapes
+are not close enough to guess between: a held connection bills wall-clock
+duration on a Durable Object, where a short poll bills a request. Neither number
+belongs in this file until somebody has run it.
 
 Long-poll rather than WebSocket, deliberately. A station runs behind a corporate
 proxy that may strip an upgrade header, and a transport that fails on those
