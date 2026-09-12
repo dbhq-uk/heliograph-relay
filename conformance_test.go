@@ -62,7 +62,8 @@ func TestTheGoServerPassesTheContractBehindARemoteAuthoriser(t *testing.T) {
 		BaseURL: srv.URL, Estate: "e1", Station: "st1",
 		Control: "ctl", StationTok: "stn",
 		OtherEstate: "e2", OtherControl: "other-ctl",
-		ControlPlane: cp.lever,
+		ControlPlane:  cp.lever,
+		AuthoriserSaw: cp.saw,
 	})
 	if !conformance.Report(os.Stdout, "go server behind a remote authoriser", rs) {
 		t.Fatal("the Go server behind RemoteAuth does not satisfy the relay contract")
@@ -79,6 +80,15 @@ type contractControlPlane struct {
 	ln  net.Listener
 	srv *http.Server
 	mu  sync.Mutex
+	// seen is every byte this control plane has been sent, unmodified, so the
+	// contract can assert that no message body was ever among them.
+	seen []byte
+}
+
+func (c *contractControlPlane) saw() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.seen...)
 }
 
 func newContractControlPlane(t *testing.T) *contractControlPlane {
@@ -130,13 +140,22 @@ var contractTokens = map[string][2]string{
 }
 
 func (c *contractControlPlane) decide(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "bad", http.StatusBadRequest)
+		return
+	}
+	c.mu.Lock()
+	c.seen = append(c.seen, raw...)
+	c.mu.Unlock()
+
 	var in struct {
 		Credential string `json:"credential"`
 		Estate     string `json:"estate"`
 		Dir        string `json:"dir"`
 		Op         string `json:"op"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := json.Unmarshal(raw, &in); err != nil {
 		http.Error(w, "bad", http.StatusBadRequest)
 		return
 	}

@@ -163,6 +163,31 @@ The Worker takes the same variable and speaks the same wire, and CI runs the
 same conformance suite against both, including an outage the suite causes
 itself.
 
+### The authoriser never touches a message
+
+Not as a rule it is asked to follow, but as something the types make impossible.
+The seam is three interfaces in `auth.go`, and none of them can carry bytes:
+
+| | |
+|---|---|
+| `Admission` | may this proceed, and what does it reserve. Can cap one operation below the server's own limit |
+| `Accounting` | what it actually cost: bytes moved, messages, outcome, duration. Settled after the fact, because a declared size is a number the payer chose |
+| `Sessions` | whether the authority behind something already open has been withdrawn. A long poll is held for 25 seconds, and "authorise every call" says nothing about a call still in progress |
+
+`TestAnAuthoriserCannotObtainAMessageBody` walks every parameter and every
+return value on that surface by reflection and fails on anything that could
+carry, reference or yield bytes. It is an allowlist rather than a denylist,
+because the thing nobody thought of is how this sort of claim usually breaks.
+
+The conformance suite checks the same thing against a **running** relay: it puts
+a recognisable pattern of bytes through, then reads back every byte the
+authoriser was sent and fails if the pattern is in there. Both implementations
+run it.
+
+This is what lets the claim sharpen rather than weaken when an operator's
+authoriser is proprietary: **the thing that touches your ciphertext is readable,
+and the thing that is not readable never touches it.**
+
 ### Why this rather than a fork
 
 The relay a hosted operator deploys is built from this source with nothing

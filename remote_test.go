@@ -128,7 +128,10 @@ func TestARefusalWithNoReasonStillRefuses(t *testing.T) {
 
 // silentRefuser refuses and says nothing, which is what an authoriser somebody
 // else wrote is entitled to do.
-type silentRefuser struct{}
+type silentRefuser struct {
+	NoAccounting
+	NoSessions
+}
 
 func (silentRefuser) Admit(context.Context, Request) Grant { return Grant{Allow: false} }
 

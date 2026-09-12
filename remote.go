@@ -17,6 +17,15 @@ import (
 // can point this at it and is not being handed a hollowed-out version of the
 // transport. heliograph-io/heliograph-cloud#7.
 type RemoteAuth struct {
+	// An authoriser reached over HTTP cannot be asked to revoke an open poll:
+	// the question travels the wrong way. Embedding NoSessions says so rather
+	// than leaving a method somebody assumes does something. Leases carry the
+	// revocation instead, in heliograph-io/heliograph-cloud#75.
+	NoSessions
+	// Nothing is metered here. An authoriser that wants accounting implements
+	// Accounting itself and wraps this, or waits for the hosted one that does.
+	NoAccounting
+
 	// URL is POSTed a decision request and must answer 200 with a decision.
 	// Anything else is an outage, not a refusal. See Admit.
 	URL    string

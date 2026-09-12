@@ -87,6 +87,55 @@ interface here and publish it.** `RemoteAuth` is in this repository, tested by
 this repository's conformance suite, and usable by anybody with an authoriser of
 their own. That is the shape every future addition takes.
 
+## The data-path rule
+
+**An authoriser never touches a message.**
+
+It is told routing, an operation and a length, and that is the whole list. The
+bytes move through code in this repository, which is published and readable; the
+thing deciding who may move them does not have to be either, because it never
+sees them.
+
+That is what turns a weaker claim into a sharper one. "The code in the path is
+code you can read" has to be given up the moment anything proprietary sits in
+the path. **"The thing that touches your ciphertext is readable, and the thing
+that is not readable never touches it"** survives, and it is the same shape as
+the argument that already works for this relay holding no keys.
+
+So the three interfaces in [`auth.go`](auth.go) carry no bytes and never will:
+
+| | |
+|---|---|
+| `Admission` | may this proceed, and what does it reserve |
+| `Accounting` | what did it actually cost, after the fact |
+| `Sessions` | has the authority behind something already open been withdrawn |
+
+**This is enforced, not requested.** `TestAnAuthoriserCannotObtainAMessageBody`
+walks every parameter and every return value on the authorisation surface by
+reflection and fails on anything that could carry, reference or yield bytes: a
+`[]byte`, a `Message`, a pointer, a map, a func, an `any`. An allowlist, not a
+denylist, because the thing nobody thought of is exactly how this claim gets
+broken.
+
+Adding an interface means adding it to `authorisationSurface` in
+`surface_test.go`. Leaving it out is how it goes unchecked.
+
+`context.Context` is the one exemption the walk has to make, and it is closed
+separately: the server passes `authCtx`, which forwards cancellation and answers
+`nil` to every `Value`. `TestTheAuthoriserIsHandedNoValuesFromTheRequest` is the
+assertion.
+
+**The constraint this imposes is hard, and it is taken deliberately rather than
+discovered.** The moment an authoriser needs to buffer, transform, inspect or
+re-frame a message, the claim breaks, and it breaks in front of the security
+reviewer this product is built for. If a feature seems to need it, the feature
+is wrong, or it belongs in the relay where it can be read.
+
+**The honest limit:** this protects the *content* claim. It does not protect
+metadata, which an authoriser necessarily holds, and which supports traffic
+analysis. Anybody who needs that covered too should run their own relay and
+their own authoriser.
+
 ## Test first, and watch the test fail
 
 A check nobody has watched fail is a check nobody knows works.
