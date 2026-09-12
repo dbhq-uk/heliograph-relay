@@ -36,12 +36,24 @@ type Message struct {
 	At      time.Time `json:"at"`   // the server's own clock, for expiry only
 }
 
-// Store holds undelivered messages.
+// Store holds undelivered messages, in memory.
 //
-// In memory, because that is the honest shape for something that deletes on
-// acknowledgement and expires in days. A relay that persisted to disk would be
-// a relay with a backup, and a backup of ciphertext is a liability that has to
-// be explained to every customer who asks what happens to their data.
+// THIS IS THE WEAKER OF THE TWO IMPLEMENTATIONS, and the difference is worth
+// knowing before choosing one. The Worker in edge/ keeps its queue in Durable
+// Object storage, which is persistent; this one does not, so a restart drops
+// whatever had not been collected. The README says so in a table rather than
+// averaging the two into one sentence, which is what it used to do.
+//
+// The original argument for memory was that a relay which persisted would be a
+// relay with a backup, and a backup of ciphertext is a liability that has to be
+// explained to every customer who asks what happens to their data. That is right
+// about LONG retention and wrong as "never to disk": a sender that receives a 200
+// and deletes its own copy has handed us the only copy, and on this transport the
+// sender is often a station nobody can log into. Holding it durably for the few
+// seconds until collection is a smaller liability than losing it.
+//
+// So making this durable too is open work, and until it is, a self-hoster running
+// the container gets the weaker guarantee and the README says which.
 type Store struct {
 	mu  sync.Mutex
 	q   map[string][]Message // keyed by estate/station/dir
