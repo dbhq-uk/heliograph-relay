@@ -275,7 +275,11 @@ actually kept.
   message can be lost. Leasing is open work
 - `conformance/` cannot assert any of this: it is asserted over HTTP, and the
   storage model is not observable to a client. So storage claims are **not**
-  conformance-enforced and must be tested per implementation
+  conformance-enforced, and each implementation asserts its own instead:
+  [`storage_test.go`](storage_test.go) for the Go server, and
+  [`edge/test/storage-model.test.ts`](edge/test/storage-model.test.ts) for the
+  Worker, which reads Durable Object storage directly because nothing over HTTP
+  can
 
 ## API
 

@@ -14,6 +14,28 @@
 //
 // Nothing in this package may import the Go server. The moment it does it
 // stops being a specification and becomes a second copy of one implementation.
+//
+// # What this suite cannot assert, and it is not a gap that can be closed here
+//
+// Every assertion is made over HTTP, so it can only reach what a client can
+// reach. A STORAGE MODEL is not one of those things. A relay that holds a
+// message in memory and a relay that writes it to disk answer every request
+// below identically, so nothing here can tell them apart.
+//
+// That is not hypothetical. The two implementations diverged on exactly this -
+// the Worker persisted every message to Durable Object storage while the README
+// said neither did - and both passed this suite the whole time
+// (heliograph-io/heliograph-cloud#47).
+//
+// So storage claims are NOT conformance-enforced and must not be assumed
+// covered because this suite is green. Each implementation asserts its own, in
+// its own tests, with access this suite does not have:
+//
+//	storage_test.go                    the Go server
+//	edge/test/storage-model.test.ts    the Worker, reading Durable Object storage
+//
+// Report says so on every run, so a green result does not read as broader than
+// it is.
 package conformance
 
 import (
@@ -310,5 +332,10 @@ func Report(w io.Writer, name string, rs []Result) bool {
 		}
 	}
 	fmt.Fprintf(w, "\n%s: %d passed, %d failed\n", name, pass, fail)
+	// Printed on every run, pass or fail. A green suite would otherwise read as
+	// "the relay is correct" when what it means is "the relay behaves correctly
+	// over HTTP", and the difference is where the two implementations diverged.
+	fmt.Fprintf(w, "not asserted here: the storage model, which is not observable over HTTP.\n"+
+		"  See storage_test.go and edge/test/storage-model.test.ts.\n")
 	return fail == 0
 }
