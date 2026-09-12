@@ -147,14 +147,54 @@ npx wrangler deploy
 
 ## Storage
 
-In memory. Deleted on collection, expired after seven days, never written to
-disk.
+**Held only until collected, or seven days, whichever comes first.** Then
+deleted. Nothing is kept after either.
 
-A relay that persisted would be a relay with a backup, and a backup of
-ciphertext is a liability that has to be explained to every customer who asks
-what happens to their data. The cost is that a restart drops undelivered
-messages, which costs a re-run - a price heliograph already accepts everywhere
-else.
+**The two implementations differ in how they hold it, and that matters enough to
+state rather than average over:**
+
+| | how | what a restart does |
+|---|---|---|
+| **Worker + Durable Object** (`edge/`) | Durable Object storage, which is persistent | nothing. A message you were told was accepted is still there |
+| **Go binary** (this repository) | in memory | drops undelivered messages, which costs a re-run |
+
+The Worker is the one deployed at `heliograph-relay.dbhq.uk`, so the hosted
+relay **does write to disk** inside that window.
+
+This documentation previously said "in memory ... never written to disk" of both,
+which was true of the Go binary and false of the Worker. That is corrected here
+rather than quietly edited, because the sentence was offered as a reason to trust
+the design and somebody may have relied on it.
+
+### Why persisting in that window is the better answer anyway
+
+The original argument was that a relay which persisted would be a relay with a
+backup, and a backup of ciphertext is a liability that has to be explained to
+every customer who asks what happens to their data. That argument is right about
+**long** retention and it was wrong to express as "never to disk".
+
+A Durable Object can lose in-memory state on a lifecycle transition. So an
+in-memory queue means a sender can receive a 200, delete its own copy believing
+the message delivered, and lose it - and on this transport the sender is often a
+station nobody can log into, holding the only copy of an hour-long capture. A
+re-run is not always available, because the state that produced the log has moved
+on.
+
+So the honest promise is not "we never write it down". It is **"we write it down
+only for as long as it takes you to collect it, and then we delete it"** - which
+is a shorter window than most systems and, unlike the previous sentence, is
+actually kept.
+
+### What is still outstanding
+
+- the Go binary is **not** durable, so a self-hoster running the container gets
+  the weaker guarantee. Making the two agree is open work
+- collection is destructive on acknowledgement rather than leased, so the window
+  between the relay deleting and the collector durably storing is still a place a
+  message can be lost. Leasing is open work
+- `conformance/` cannot assert any of this: it is asserted over HTTP, and the
+  storage model is not observable to a client. So storage claims are **not**
+  conformance-enforced and must be tested per implementation
 
 ## API
 
