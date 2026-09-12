@@ -8,10 +8,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dbhq-uk/heliograph-relay/conformance"
@@ -69,6 +71,7 @@ func main() {
 			os.Exit(2)
 		}
 		defer cp.stop()
+		target.AuthoriserSaw = cp.Saw
 		// The lever. Calling it takes the authoriser away the way a database
 		// failure or a bad deployment would, and the returned function puts it
 		// back.
@@ -101,6 +104,18 @@ type controlPlane struct {
 	tokens map[string][2]string // estate -> {control, station}
 	srv    *http.Server
 	ln     net.Listener
+
+	// saw is every byte this control plane has been sent, unmodified, so the
+	// suite can assert that no message body was ever among them.
+	mu  sync.Mutex
+	saw []byte
+}
+
+// Saw returns everything sent so far.
+func (c *controlPlane) Saw() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.saw...)
 }
 
 func (c *controlPlane) start() error {
@@ -122,13 +137,22 @@ func (c *controlPlane) stop() {
 }
 
 func (c *controlPlane) decide(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "could not read the decision request", http.StatusBadRequest)
+		return
+	}
+	c.mu.Lock()
+	c.saw = append(c.saw, raw...)
+	c.mu.Unlock()
+
 	var in struct {
 		Credential string `json:"credential"`
 		Estate     string `json:"estate"`
 		Dir        string `json:"dir"`
 		Op         string `json:"op"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := json.Unmarshal(raw, &in); err != nil {
 		http.Error(w, "could not read the decision request", http.StatusBadRequest)
 		return
 	}

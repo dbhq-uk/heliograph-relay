@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -262,7 +263,27 @@ func token(r *http.Request) string {
 	return ""
 }
 
+// authCtx carries a request's cancellation and none of its values.
+//
+// The context an http.Handler is given holds whatever the serving stack put
+// there, and handing that to an authoriser would be a route into the request
+// that every other part of this interface is built to close. Deadline and Done
+// are forwarded, because a hung authoriser must still be cancellable when the
+// client goes away. Value always answers nil.
+//
+// It is one of two arguments for the same claim. The other is in
+// surface_test.go, which walks every type on the authorisation surface and
+// rejects anything that could carry bytes. A context is the one thing that walk
+// has to exempt, so it is closed here instead.
+type authCtx struct{ inner context.Context }
+
+func (c authCtx) Deadline() (time.Time, bool) { return c.inner.Deadline() }
+func (c authCtx) Done() <-chan struct{}       { return c.inner.Done() }
+func (c authCtx) Err() error                  { return c.inner.Err() }
+func (c authCtx) Value(any) any               { return nil }
+
 func (s *Server) put(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	estate, station, dir := r.PathValue("estate"), r.PathValue("station"), r.PathValue("dir")
 	// The direction is route shape, not credential scope, so it is refused
 	// before the authoriser is asked and refused as a 400. The Worker has
@@ -273,28 +294,62 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		refuse(w, Grant{Reason: ReasonBadRoute})
 		return
 	}
-	g := s.auth.Admit(r.Context(), Request{
+	ctx := authCtx{r.Context()}
+	req := Request{
 		Credential: token(r), Estate: estate, Station: station, Dir: dir,
-		Op: OpWrite, Bytes: r.ContentLength, At: time.Now(),
-	})
+		Op: OpWrite, Bytes: r.ContentLength, At: started,
+	}
+	g := s.auth.Admit(ctx, req)
 	if !g.Allow {
 		s.refused(g, estate, station, dir, OpWrite)
 		refuse(w, g)
 		return
 	}
+	settle := func(bytes int64, messages int, outcome Outcome) {
+		s.auth.Settle(ctx, Settlement{
+			Ref: g.Ref, Estate: estate, Station: station, Dir: dir, Op: OpWrite,
+			Bytes: bytes, Messages: messages, Outcome: outcome,
+			At: time.Now(), Started: started,
+		})
+	}
 
-	body := http.MaxBytesReader(w, r.Body, MaxBodyBytes+1024)
+	// The admission cap, when it is tighter than ours. An authoriser can hold a
+	// client to a smaller message than MaxBodyBytes without the server having
+	// to know what a plan is.
+	limit := int64(MaxBodyBytes)
+	if g.MaxBytes > 0 && g.MaxBytes < limit {
+		limit = g.MaxBytes
+	}
+	body := http.MaxBytesReader(w, r.Body, limit+1024)
 	var in struct {
 		Seq  uint64 `json:"seq"`
 		Body []byte `json:"body"`
 	}
 	if err := json.NewDecoder(body).Decode(&in); err != nil {
+		// A body over the cap fails here, in the reader, and it is a size
+		// refusal rather than a parse refusal. Reporting it as unreadable would
+		// send somebody to check their JSON.
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			settle(0, 0, OutcomeRefused)
+			refuse(w, Grant{Reason: ReasonTooLarge})
+			return
+		}
+		settle(0, 0, OutcomeRefused)
 		refuse(w, Grant{Reason: ReasonUnreadable})
+		return
+	}
+	if int64(len(in.Body)) > limit {
+		settle(0, 0, OutcomeRefused)
+		refuse(w, Grant{Reason: ReasonTooLarge})
 		return
 	}
 	err := s.store.Put(Message{
 		Estate: estate, Station: station, Dir: dir, Seq: in.Seq, Body: in.Body,
 	})
+	if err != nil {
+		settle(0, 0, OutcomeRefused)
+	}
 	switch {
 	case errors.Is(err, ErrTooLarge):
 		refuse(w, Grant{Reason: ReasonTooLarge, Detail: err.Error()})
@@ -312,6 +367,11 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Accounting sees what actually moved, which is not what the client
+	// declared. Charging on Content-Length would be charging on a number the
+	// payer chose.
+	settle(int64(len(in.Body)), 1, OutcomeAccepted)
+
 	// Metadata only. Never the body, never a token, not even its length in a
 	// way that could be reassembled into content.
 	s.log.Info("put", "estate", estate, "station", station, "dir", dir,
@@ -321,19 +381,29 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	estate, station, dir := r.PathValue("estate"), r.PathValue("station"), r.PathValue("dir")
 	if !validDir(dir) {
 		refuse(w, Grant{Reason: ReasonBadRoute})
 		return
 	}
-	g := s.auth.Admit(r.Context(), Request{
+	ctx := authCtx{r.Context()}
+	req := Request{
 		Credential: token(r), Estate: estate, Station: station, Dir: dir,
-		Op: OpRead, At: time.Now(),
-	})
+		Op: OpRead, At: started,
+	}
+	g := s.auth.Admit(ctx, req)
 	if !g.Allow {
 		s.refused(g, estate, station, dir, OpRead)
 		refuse(w, g)
 		return
+	}
+	settle := func(bytes int64, messages int, outcome Outcome) {
+		s.auth.Settle(ctx, Settlement{
+			Ref: g.Ref, Estate: estate, Station: station, Dir: dir, Op: OpRead,
+			Bytes: bytes, Messages: messages, Outcome: outcome,
+			At: time.Now(), Started: started,
+		})
 	}
 	limit := 0
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -342,6 +412,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 
 	msgs, err := s.store.Take(estate, station, dir, limit)
 	if err != nil {
+		settle(0, 0, OutcomeRefused)
 		refuse(w, Grant{Reason: ReasonBadRoute, Detail: err.Error()})
 		return
 	}
@@ -349,9 +420,31 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		// Long-poll. An idle station costs one held connection rather than a
 		// request every few seconds, which is what makes a poll interval of
 		// "immediately" affordable on a link somebody is paying for.
-		if s.hold(r, key(estate, station, dir)) {
+		//
+		// The poll also watches for its own authority being withdrawn, because
+		// "authorise every call" says nothing about a call that is still in
+		// progress and this one is held for 25 seconds by design.
+		woken, revoked := s.hold(r, key(estate, station, dir), s.auth.Watch(ctx, req, g.Ref))
+		switch {
+		case revoked != ReasonAllowed:
+			settle(0, 0, OutcomeRevoked)
+			s.refused(Grant{Reason: revoked}, estate, station, dir, OpRead)
+			refuse(w, Grant{Reason: revoked})
+			return
+		case woken:
 			msgs, _ = s.store.Take(estate, station, dir, limit)
 		}
+	}
+	delivered := int64(0)
+	for _, m := range msgs {
+		delivered += int64(len(m.Body))
+	}
+	// An empty collection is settled too. An idle station polls for ever, and a
+	// held connection nobody meters is a cost whose first appearance is a bill.
+	if len(msgs) == 0 {
+		settle(0, 0, OutcomeEmpty)
+	} else {
+		settle(delivered, len(msgs), OutcomeDelivered)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if msgs == nil {
@@ -360,8 +453,14 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(msgs)
 }
 
-// hold waits for a message, the timeout, or the client going away.
-func (s *Server) hold(r *http.Request, k string) bool {
+// hold waits for a message, the timeout, the client going away, or the
+// authority behind the poll being withdrawn.
+//
+// The second return is the reason the authority ended, and ReasonAllowed means
+// it did not. revoke may be nil, which is the right answer for an authoriser
+// with no revocation to report: a nil channel blocks for ever, so the select
+// falls through to the other three cases exactly as it did before.
+func (s *Server) hold(r *http.Request, k string, revoke <-chan Reason) (bool, Reason) {
 	ch := make(chan struct{}, 1)
 	s.mu.Lock()
 	s.waiters[k] = append(s.waiters[k], ch)
@@ -386,13 +485,22 @@ func (s *Server) hold(r *http.Request, k string) bool {
 	defer timer.Stop()
 	select {
 	case <-ch:
-		return true
+		return true, ReasonAllowed
+	case why := <-revoke:
+		// Authority withdrawn while the line was held. If the authoriser sent
+		// nothing useful, still refuse: a closed channel reads as a zero value,
+		// and treating that as "carry on" would turn a revocation into a
+		// delivery.
+		if why == ReasonAllowed {
+			why = ReasonRevoked
+		}
+		return false, why
 	case <-timer.C:
-		return false
+		return false, ReasonAllowed
 	case <-r.Context().Done():
 		// The client hung up. Returning rather than holding the goroutine is
 		// what stops a flapping link accumulating them.
-		return false
+		return false, ReasonAllowed
 	}
 }
 
