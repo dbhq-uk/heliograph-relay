@@ -139,6 +139,27 @@ The real cost is drift, and that is answered the same way heliograph answers it
 everywhere else - one specification, several implementations, and none of them
 trusted until it has passed.
 
+The hosted relay deploys **on a tag**, through
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
+
+```bash
+git tag v0.3.0 && git push --tags
+```
+
+The workflow runs the contract first, deploys, then **polls the live relay until
+`/version` reports the commit it just built**. A green deploy step with the old
+code still answering is exactly the drift this is meant to catch, so deploying
+and having deployed are checked separately.
+
+Pushing to `main` deploys nothing. The relay other people's stations are talking
+to should change on a deliberate act.
+
+Secrets required: `CLOUDFLARE_API_TOKEN` scoped to Workers deploy on this account,
+and `CLOUDFLARE_ACCOUNT_ID`. `HELIOGRAPH_RELAY_ESTATES` stays a wrangler secret,
+set once and never in CI.
+
+### Deploying by hand, if you must
+
 ```bash
 cd edge
 npx wrangler secret put HELIOGRAPH_RELAY_ESTATES   # estate:controlToken:stationToken
@@ -149,6 +170,10 @@ npx wrangler deploy --var VERSION:"$(git rev-parse HEAD)"
 `{"version":"unknown"}` and nobody, including whoever deployed it, can tell which
 commit is running. A relay whose proposition is that you can read it before you
 run it ought to be able to say which "it" you are reading.
+
+This is also why the workflow exists: a human can pass the wrong commit to
+`--var` and the endpoint will repeat it confidently. CI stamps the commit it
+actually built.
 
 ## Identity
 

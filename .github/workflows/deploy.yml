@@ -1,0 +1,95 @@
+name: deploy
+
+# Tagging deploys. Pushing to main does not.
+#
+# The relay other people's stations are talking to should change on a
+# deliberate act, not as a side effect of merging a pull request. A tag is that
+# act, and it is also the public source tag the provenance claim needs: the
+# commit a reader can check the deployment against.
+#
+# This exists because the alternative was somebody running `wrangler deploy`
+# from a laptop, which is how `/version` came to be needed at all. A workflow
+# stamps the commit it is actually building, so the endpoint cannot be wrong
+# about which commit it came from - a human passing the wrong `--var` can be.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag or commit to deploy'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # Two deploys racing would leave the live version ambiguous, which is the
+  # exact thing this is for.
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy the tagged commit and prove what answered
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # The same contract the validate workflow runs. A tag that cannot pass
+      # conformance must not reach the thing in somebody's estate, and it is
+      # cheaper to find out here than from a station that has gone quiet.
+      - name: the contract, before anything is deployed
+        run: go test ./...
+
+      - name: install
+        working-directory: edge
+        run: npm install --no-fund --no-audit
+
+      - name: typecheck
+        working-directory: edge
+        run: npx tsc --noEmit
+
+      - name: deploy
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy --var VERSION:"${{ github.sha }}"
+
+      # Deploying is not the same as having deployed. Cloudflare propagates,
+      # and a green deploy step with the old code still answering is precisely
+      # the drift this whole endpoint exists to catch.
+      - name: prove the live relay is answering as this commit
+        run: |
+          want='${{ github.sha }}'
+          for i in $(seq 1 30); do
+            got="$(curl -fsS https://heliograph-relay.dbhq.uk/version \
+                    | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" || got=''
+            [ "$got" = "$want" ] && { echo "live version is $got"; exit 0; }
+            echo "attempt $i: live version is '${got:-unreachable}', want $want"
+            sleep 5
+          done
+          echo "::error::the deploy reported success and the live relay never reported $want"
+          exit 1
+
+      - name: and that it still passes the contract in production
+        # Read-only against the live service: /health, /, /version. The queue
+        # checks need estate credentials and are deliberately not run here.
+        run: |
+          curl -fsS https://heliograph-relay.dbhq.uk/health >/dev/null
+          curl -fsS -H 'Accept: text/html' https://heliograph-relay.dbhq.uk/ \
+            | grep -q '<title>heliograph relay</title>'

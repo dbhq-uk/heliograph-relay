@@ -154,6 +154,24 @@ func Run(t Target) []Result {
 			fmt.Sprintf("source=%q", got.Source))
 	}
 
+	// A browser must get a page, not a download. / used to answer
+	// {"error":"no such route"} with a JSON content type, and mobile Safari
+	// offered that as a 25-byte file rather than showing it - which is what
+	// somebody who pasted the hostname into a phone actually got.
+	{
+		req, _ := http.NewRequest("GET", base+"/", nil)
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+		resp, err := t.client().Do(req)
+		ct := ""
+		if resp != nil {
+			ct = resp.Header.Get("Content-Type")
+			_ = resp.Body.Close()
+		}
+		ok("/ gives a browser HTML rather than a file to download",
+			err == nil && strings.HasPrefix(ct, "text/html"),
+			fmt.Sprintf("content-type=%q err=%v", ct, err))
+	}
+
 	// --- a message goes in and comes back unchanged ----------------------
 	// Bytes that are not valid UTF-8 and not valid JSON, because the body is
 	// ciphertext and the relay must never interpret it.

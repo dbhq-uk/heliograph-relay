@@ -35,6 +35,46 @@ const WHAT_IT_IS =
 const SOURCE_URL = "https://github.com/dbhq-uk/heliograph-relay";
 const DOCS_URL = "https://heliograph.dbhq.uk/relay";
 
+// A browser asking for / must get a page, not a download prompt. Returning
+// application/json makes mobile Safari offer the response as a file, which is
+// what somebody who pasted this hostname into a phone actually saw. Machines
+// still get JSON, because the endpoint is also how a check reads the version.
+function wantsHTML(req: Request): boolean {
+  const accept = req.headers.get("accept") ?? "";
+  return accept.includes("text/html");
+}
+
+function landingHTML(version: string): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>heliograph relay</title>
+<style>
+ body{background:#111;color:#eee;font:16px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:2rem 1.25rem;max-width:38rem}
+ h1{font-size:1.1rem;margin:0 0 1rem;font-weight:600}
+ p{margin:0 0 1rem}
+ dt{color:#8b8b8b;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;margin-top:1rem}
+ dd{margin:.15rem 0 0;word-break:break-all}
+ a{color:#6cf}
+</style></head><body>
+<h1>heliograph relay</h1>
+<p>${WHAT_IT_IS}</p>
+<p>This is an API endpoint. There is nothing to use here by hand.</p>
+<dl>
+ <dt>version</dt><dd>${version}</dd>
+ <dt>source</dt><dd><a href="${SOURCE_URL}">${SOURCE_URL}</a></dd>
+ <dt>documentation</dt><dd><a href="${DOCS_URL}">${DOCS_URL}</a></dd>
+</dl>
+</body></html>`;
+}
+
+function html(body: string): Response {
+  return new Response(body, {
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
 // Never an empty string. A deploy with no version stamped says "unknown",
 // which is a true answer an operator can act on, where a blank field reads as
 // a bug in whatever asked.
@@ -224,6 +264,7 @@ export default {
     // config file and pasted it into a browser used to get a bare 404, which
     // tells them nothing about what they have found or whether it is theirs.
     if (url.pathname === "/") {
+      if (wantsHTML(req)) return html(landingHTML(reportedVersion(env)));
       return json({
         service: "heliograph-relay",
         implementation: "worker",
