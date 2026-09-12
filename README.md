@@ -55,19 +55,42 @@ how long a step took. Padding was considered and rejected for now: it costs
 bandwidth on links that are often poor, and the leak is coarse. It is stated
 here rather than implied away.
 
-## Tokens are not the security boundary
+## Tokens are not the security boundary for content or execution
 
-The bearer tokens exist for routing, rate limiting and abuse control. They carry
-no confidentiality or authenticity role whatsoever.
+Content and execution are settled by signatures this server cannot make. Every
+message arrives already sealed, and every request is signed by a key the relay
+does not hold, so **a stolen token yields no plaintext and cannot cause a
+station to run anything.** Saying so plainly matters, because "we use scoped
+tokens" is exactly the kind of claim that gets mistaken for the real protection.
 
-**A stolen token yields denial of service and metadata, never content and never
-execution.** Saying so plainly matters, because "we use scoped tokens" is
-exactly the kind of claim that gets mistaken for the real protection.
+**They are the boundary for four other things, and all four matter to whoever
+is paying for the transport:**
 
-They are asymmetric on purpose: a **station** token may read requests and write
-status and logs, and may **not** queue a request, even for its own station. A
-station credential sits on a machine nobody can reach and cannot be rotated
-quickly.
+| a stolen token lets somebody | and the cost is |
+|---|---|
+| **collect** a queue | ciphertext they cannot read - and the legitimate collector never gets it, because collecting deletes. Silent loss, not silent disclosure |
+| **fill** a queue to `DefaultMaxQueue` | the real sender gets a 429 and delivery stops |
+| **spend** whatever the operator is metering | denial of service, on somebody else's bill |
+| **cross a tenant boundary**, wherever one authoriser serves several customers | one customer's routing keys reachable with another's credential |
+
+The first row is the one that changed. This section used to say "a stolen token
+yields denial of service and metadata", and that sentence was written when a
+lost message cost a re-run. `Store.Take` (`relay.go:131`) deletes in the same
+breath as it returns, and on this transport the sender is often a station nobody
+can log into, holding the only copy of an hour-long capture. A re-run is not
+always available, because the state that produced the log has moved on.
+
+Leased collection would change that row from "silent loss" to "a nuisance", and
+it is open work rather than something this server does today. See
+[What is still outstanding](#what-is-still-outstanding).
+
+So treat a station token as a credential worth protecting, even though it cannot
+read anything.
+
+Tokens are asymmetric on purpose: a **station** token may read requests and
+write status and logs, and may **not** queue a request, even for its own
+station. A station credential sits on a machine nobody can reach and cannot be
+rotated quickly.
 
 ## Run it
 

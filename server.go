@@ -43,14 +43,22 @@ type Server struct {
 
 // Auth decides whether a token may act on a route.
 //
-// Deliberately small, and deliberately NOT a security boundary for content. A
-// stolen token yields denial of service and metadata: it can queue rubbish, and
-// it can collect ciphertext it cannot read. It can never produce plaintext or
-// cause a station to run anything, because both of those are settled by
-// signatures this server cannot make.
+// Deliberately small, and deliberately NOT a security boundary for content or
+// execution. A stolen token can never produce plaintext and can never cause a
+// station to run anything, because both of those are settled by signatures this
+// server cannot make. Saying that plainly matters, because "we use scoped
+// tokens" is exactly the sort of claim that gets mistaken for the real
+// protection.
 //
-// Saying that plainly matters, because "we use scoped tokens" is exactly the
-// sort of claim that gets mistaken for the real protection.
+// It IS the boundary for four things, and they are the ones an operator paying
+// for the transport notices: collection, availability, tenant isolation and
+// whatever is being metered. Collection is the sharp one. Store.Take deletes in
+// the same breath as it returns (relay.go:131), so a stolen token causes silent
+// LOSS rather than silent disclosure - and on this transport the sender is
+// often a station nobody can log into, holding the only copy. The unqualified
+// sentence that used to be here read as "token handling is unimportant", which
+// is wrong in exactly the case somebody is paying for.
+//
 // Reading and writing are separate methods rather than one method and a
 // type assertion. The first version had the write restriction behind
 // `if sa, ok := auth.(*StaticAuth)`, which meant any other implementation
