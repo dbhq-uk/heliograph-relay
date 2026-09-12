@@ -39,6 +39,33 @@ tell a redaction from an argument that was never made.
 **Nobody is ahead of you in the queue.** Hosted users get no earlier warning of a
 relay vulnerability than self-hosters do.
 
+### A published claim that turns out to be false
+
+A claim in the documentation can be wrong in the way code can, and this process
+covers it. Report one the same way, privately, rather than opening a public
+issue: until it is corrected, a public issue is a signpost to the gap between
+what the documentation promises and what the service does.
+
+Which clock applies turns on exposure, not on how bad the sentence reads:
+
+| | clock |
+|---|---|
+| the documentation described a protection that is not there | the table above, and an advisory is published |
+| the service was already doing the stronger thing and the documentation described the weaker one | none. Nobody was exposed by the gap, so there is nothing to disclose on a deadline |
+
+Either way the correction is **published in the document that carried the
+claim**, and says what that document used to say. A sentence offered as a reason
+to trust the design does not get quietly edited, because somebody may have
+approved this relay on the strength of it.
+
+The Storage section of the [README](README.md) is this in practice. It had said
+messages were held in memory and "never written to disk", which was true of the
+Go binary and false of the Worker that is actually deployed, and that Worker was
+persisting every message so that an accepted one could not be lost. The second
+clock applied: the correction states the old sentence, why it was wrong, and
+what each implementation does now
+([#1](https://github.com/dbhq-uk/heliograph-relay/pull/1)).
+
 The same policy, in full, is in
 [heliograph's `SECURITY.md`](https://github.com/dbhq-uk/heliograph/blob/main/SECURITY.md).
 
@@ -84,6 +111,12 @@ estate (`cmd/heliograph-relay/main.go:70-75`). The Worker skips that estate
 Held only until collected, or seven days, whichever comes first. See the Storage
 section of the [README](README.md) for what each implementation actually does,
 including where they differ, because they do.
+
+Each claim there is asserted in that implementation's own tests -
+`storage_test.go` for the Go server, `edge/test/storage-model.test.ts` for the
+Worker. Not in `conformance/`, which is asserted over HTTP: a storage model is
+not observable to a client, so a conformance run cannot tell memory from disk and
+a green one is not evidence about either.
 
 ### What a compromised relay could still do
 
