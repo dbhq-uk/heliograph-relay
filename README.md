@@ -68,7 +68,7 @@ is paying for the transport:**
 
 | a stolen token lets somebody | and the cost is |
 |---|---|
-| **collect** a queue | ciphertext they cannot read - and the legitimate collector never gets it, because collecting deletes. Silent loss, not silent disclosure |
+| **collect** a queue | ciphertext they cannot read - and the legitimate collector never gets it, because a collection with no lease deletes. Silent loss, not silent disclosure. A thief who collects **under a lease** and never acknowledges causes a delay rather than a loss, but a thief chooses |
 | **fill** a queue to `DefaultMaxQueue` | the real sender gets a 429 and delivery stops |
 | **spend** whatever the operator is metering | denial of service, on somebody else's bill |
 | **cross a tenant boundary**, wherever one authoriser serves several customers | one customer's routing keys reachable with another's credential |
@@ -80,9 +80,13 @@ breath as it returns, and on this transport the sender is often a station nobody
 can log into, holding the only copy of an hour-long capture. A re-run is not
 always available, because the state that produced the log has moved on.
 
-Leased collection would change that row from "silent loss" to "a nuisance", and
-it is open work rather than something this server does today. See
-[What is still outstanding](#what-is-still-outstanding).
+**Leased collection now exists** ([Collecting under a lease](#collecting-under-a-lease)),
+and it changes that row for the honest collector rather than for the thief. A
+collector that leases and dies loses nothing, because the messages come back. A
+thief who has stolen a token still collects destructively if it chooses to, since
+`?lease=` is the client's choice and the relay cannot tell the difference. What the
+lease removes is the accidental loss, which is the common case; what it does not
+remove is the deliberate one, which needs the token not to be stolen.
 
 So treat a station token as a credential worth protecting, even though it cannot
 read anything.
@@ -591,11 +595,11 @@ SQLite page granularity and may differ on the platform.
 
 ### What is still outstanding
 
-- collection is destructive on acknowledgement rather than leased, so the window
-  between the relay deleting and the collector durably storing is still a place a
-  message can be lost. Leasing is open work
 - the Worker stores one queue as one value, so a put rewrites every message
   already queued. Correct, and more expensive than it needs to be
+- the CLI and the station still collect without a lease, so the loss window is
+  closed in the relay and not yet in the collector. Leasing is opt-in and the
+  client side of it is work in `dbhq-uk/heliograph` rather than here
 - `conformance/` asserts **durability** for both implementations, because an
   accepted message outliving a restart is observable as soon as the harness can
   restart the relay (`conformance -restart`, and the scripts in
@@ -609,15 +613,80 @@ SQLite page granularity and may differ on the platform.
 ## API
 
 ```
-POST /v1/{estate}/{station}/{dir}    queue a message   (dir: c2s | s2c)
-GET  /v1/{estate}/{station}/{dir}    collect, long-polling by default
-GET  /health                         liveness, plus the version and hash serving, no token
-GET  /version                        which commit is answering, no token
-GET  /                               the same, plus what this server is
+POST /v1/{estate}/{station}/{dir}        queue a message   (dir: c2s | s2c)
+GET  /v1/{estate}/{station}/{dir}        collect, long-polling by default
+POST /v1/{estate}/{station}/{dir}/ack    confirm a leased collection
+GET  /health                             liveness, the version and hash serving,
+                                         and whether this deployment is durable
+GET  /version                            which commit is answering, no token
+GET  /                                   the same, plus what this server is
 ```
+
+`/health`, `/version` and `/` need no token.
 
 `GET` on a queue holds the connection for up to 25 seconds waiting for a
 message. Add `?wait=0` to return immediately.
+
+| parameter on `GET` | |
+|---|---|
+| `wait=0` | answer immediately rather than holding the line |
+| `limit=N` | at most N messages |
+| `lease=30s` | hold the messages instead of deleting them, and answer with a lease to acknowledge. Absent or `0` means the old behaviour, unchanged |
+
+## Collecting under a lease
+
+Collection without a lease deletes as it returns, which leaves a window: between
+the relay deleting and the collector durably storing, the message exists nowhere.
+On this transport what is in that window is frequently the only copy of a capture
+from a machine nobody can log into.
+
+```
+   collector                        relay
+      │   GET ?lease=30s              │
+      │ ────────────────────────────► │  marked, NOT deleted
+      │ ◄──────────────────────────── │  {"lease":"L7","until":"...","messages":[...]}
+      │                               │
+      │   write it down locally       │
+      │                               │
+      │   POST .../ack {"lease":"L7"} │
+      │ ────────────────────────────► │  now deleted
+      │                               │
+      │   (crashed instead?)          │  the lease expires and the messages return
+```
+
+```bash
+# collect, holding a lease for thirty seconds
+r=$(curl -s "$RELAY/v1/$ESTATE/$STATION/c2s?wait=0&lease=30s" -H "Authorization: Bearer $TOK")
+echo "$r" | jq -c '.messages[]' | while read -r m; do ...; done   # write it down first
+
+# then, and only then
+curl -s -X POST "$RELAY/v1/$ESTATE/$STATION/c2s/ack" \
+  -H "Authorization: Bearer $TOK" \
+  -d "{\"lease\":$(echo "$r" | jq '.lease')}"
+```
+
+| | |
+|---|---|
+| the lease duration | `30s`, `500ms`, `2m`, or a bare number of seconds like `30`. At most **5 minutes**, and a longer one is refused rather than clamped, because a collector that thinks it has an hour behaves differently from one that knows it has five minutes |
+| while a lease is live | those messages go to nobody else, whether or not the other collector asks for a lease |
+| when it expires unacknowledged | the messages return, **in their original position**, and are collectable again |
+| acknowledging twice | the second is `410 Gone`. So is acknowledging a lease that expired, and the collector's safe response to both is the same: expect the messages again |
+| acknowledging | takes the same credential as collecting. A station may confirm the requests it collects and still may not queue one |
+
+**Every message now carries an `id`**, leased or not, and it does not change when a
+message is redelivered. That is what a collector deduplicates on, and the relay
+guarantees three things about it: it is stable for the life of the message, it
+survives a relay restart, and it is never reused - not even after a queue empties.
+An id is unique within its route and is not comparable between routes.
+
+**What the relay cannot do for you, stated plainly.** A lease that expires before
+the collector acknowledges means the messages are delivered twice, and no broker
+can prevent that: the collector is the only party that knows whether it finished
+writing. So a collector must be idempotent on the message id, and a request
+redelivered to a station must not cause a second run. The station keys runs by
+request id and triggers only on a change to that id, which makes this hold - and it
+now holds load-bearingly rather than incidentally, so it belongs in a test on the
+station side rather than in a sentence here.
 
 **The long poll is available; the bash station does not use it.** It fetches
 `?wait=0` on an interval that defaults to five seconds. This README used to say

@@ -19,6 +19,7 @@ package relay
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -29,6 +30,12 @@ import (
 // where the number is signed and a hostile relay cannot lie about it. Enforcing
 // it here would look like a safety feature and would be worth nothing.
 type Message struct {
+	// ID is stable for the life of the message, including across a redelivery.
+	// It is what a collector deduplicates on: an expired lease followed by a
+	// successful one delivers the same message twice, and the collector has to
+	// be able to tell. Unique within its route, opaque, and not comparable
+	// between routes.
+	ID      string    `json:"id"`
 	Estate  string    `json:"estate"`
 	Station string    `json:"station"`
 	Dir     string    `json:"dir"` // c2s or s2c
@@ -40,6 +47,11 @@ type Message struct {
 	// is never serialised to a client: which path a relay keeps a message at is
 	// the operator's business and nobody else's.
 	file string
+	// lease and leaseUntil are the collector currently holding this message, if
+	// any. Unexported: whose lease a message is under is between the relay and
+	// that collector, and a second collector learns only that it is unavailable.
+	lease      string
+	leaseUntil time.Time
 }
 
 // Store holds undelivered messages: in memory, and durably as well when the
@@ -79,6 +91,13 @@ type Store struct {
 	// spool is the durable copy, or nil. nil is the default and behaves exactly
 	// as this store always has. See spool.go and OpenSpool.
 	spool *spool
+
+	// ids names messages, leases names leases, and epoch separates this run of
+	// the process from the last one so that an acknowledgement from before a
+	// restart cannot match a lease granted after it. See lease.go.
+	ids    uint64
+	leases uint64
+	epoch  string
 }
 
 // Limits chosen so that a misbehaving client is a problem for itself.
@@ -105,6 +124,10 @@ func NewStore() *Store {
 		ttl: DefaultTTL,
 		max: DefaultMaxQueue,
 		now: time.Now,
+		// The real clock rather than s.now, because this identifies the process
+		// rather than a moment in the store's logical time. A test that freezes
+		// the clock must still get a different epoch from the run before it.
+		epoch: strconv.FormatInt(time.Now().UnixNano(), 36),
 	}
 }
 
@@ -141,6 +164,7 @@ func (s *Store) Put(m Message) error {
 		return ErrQueueFull
 	}
 	m.At = s.now()
+	m.ID = s.nextIDLocked()
 
 	// Durable before acknowledged, when there is a spool. The order is the whole
 	// guarantee: a sender that receives a 202 must never be the only holder of
@@ -157,13 +181,21 @@ func (s *Store) Put(m Message) error {
 	return nil
 }
 
-// Take returns everything queued for a recipient and removes it.
+// Take returns everything available for a recipient and removes it.
 //
-// Delete on collection, not on a separate acknowledgement. A second round trip
-// to confirm receipt would mean holding ciphertext for longer in exchange for
-// surviving a client that crashes between reading and processing - and that
-// client can simply ask for the step again, which is a cost heliograph already
-// accepts everywhere else.
+// Delete on collection, which is what this has always done and what a request
+// without ?lease= still gets. The argument for it was that a second round trip to
+// confirm receipt would hold ciphertext for longer, and that a client crashing
+// between reading and processing "can simply ask for the step again" - which is
+// false, because the message is already deleted. TakeLeased in lease.go is the
+// answer to that, and it is opt-in precisely so that this path does not change
+// for the stations already deployed.
+//
+// "Available" means not currently held under somebody's lease. With no leases in
+// play, which is every request from a client that has not asked for one, that is
+// the whole queue and this is byte for byte the old behaviour. A leased message is
+// skipped rather than taken, because a lease that any other collector could
+// override would guarantee nothing.
 func (s *Store) Take(estate, station, dir string, limit int) ([]Message, error) {
 	if !validRoute(estate, station, dir) {
 		return nil, ErrBadRoute
@@ -172,19 +204,30 @@ func (s *Store) Take(estate, station, dir string, limit int) ([]Message, error) 
 	defer s.mu.Unlock()
 	k := key(estate, station, dir)
 	s.expireLocked(k)
+	s.expireLeasesLocked(k)
 
 	msgs := s.q[k]
 	if len(msgs) == 0 {
 		return nil, nil
 	}
-	if limit > 0 && len(msgs) > limit {
-		s.q[k] = msgs[limit:]
-		s.dropDurableLocked(msgs[:limit])
-		return msgs[:limit], nil
+	var taken, kept []Message
+	for _, m := range msgs {
+		if m.lease != "" || (limit > 0 && len(taken) >= limit) {
+			kept = append(kept, m)
+			continue
+		}
+		taken = append(taken, m)
 	}
-	delete(s.q, k)
-	s.dropDurableLocked(msgs)
-	return msgs, nil
+	if len(taken) == 0 {
+		return nil, nil
+	}
+	if len(kept) == 0 {
+		delete(s.q, k)
+	} else {
+		s.q[k] = kept
+	}
+	s.dropDurableLocked(taken)
+	return taken, nil
 }
 
 // dropDurableLocked removes the durable copies of messages that have left the

@@ -101,11 +101,21 @@ const (
 	ReasonRevoked Reason = "authority-revoked"
 
 	// About the request or the queue.
-	ReasonBadRoute   Reason = "bad-route"
-	ReasonUnreadable Reason = "unreadable-request"
-	ReasonTooLarge   Reason = "too-large"
-	ReasonQueueFull  Reason = "queue-full"
-	ReasonInternal   Reason = "internal"
+	// ReasonBadLease is a ?lease= the relay will not grant: not a duration, or
+	// longer than MaxLease. Refused rather than clamped, because a collector that
+	// believes it has an hour behaves differently from one that knows it has five
+	// minutes.
+	ReasonBadLease Reason = "bad-lease"
+	// ReasonNoSuchLease means the relay is not holding the lease an
+	// acknowledgement names: it expired, it was already acknowledged, or it never
+	// existed. 410 rather than 404, because the route exists and the lease is
+	// what is gone.
+	ReasonNoSuchLease Reason = "no-such-lease"
+	ReasonBadRoute    Reason = "bad-route"
+	ReasonUnreadable  Reason = "unreadable-request"
+	ReasonTooLarge    Reason = "too-large"
+	ReasonQueueFull   Reason = "queue-full"
+	ReasonInternal    Reason = "internal"
 )
 
 // Status is the HTTP code a Reason must produce.
@@ -124,8 +134,10 @@ func (r Reason) Status() int {
 		return http.StatusTooManyRequests
 	case ReasonTooLarge:
 		return http.StatusRequestEntityTooLarge
-	case ReasonBadRoute, ReasonUnreadable:
+	case ReasonBadRoute, ReasonUnreadable, ReasonBadLease:
 		return http.StatusBadRequest
+	case ReasonNoSuchLease:
+		return http.StatusGone
 	case ReasonInternal:
 		return http.StatusInternalServerError
 	}
@@ -157,6 +169,10 @@ func (r Reason) Detail() string {
 		return ErrNotDurable.Error()
 	case ReasonBadRoute:
 		return "a message must name an estate, a station and a direction of c2s or s2c"
+	case ReasonBadLease:
+		return ErrBadLease.Error()
+	case ReasonNoSuchLease:
+		return ErrNoSuchLease.Error()
 	case ReasonUnreadable:
 		return "could not read the message"
 	case ReasonTooLarge:
@@ -288,6 +304,11 @@ const (
 	OutcomeRefused Outcome = "refused"
 	// OutcomeRevoked is something ended mid-flight by Sessions.Watch.
 	OutcomeRevoked Outcome = "revoked"
+	// OutcomeAcknowledged is a leased collection the collector has confirmed it
+	// holds, so the relay has deleted it. It settles a message count and no
+	// bytes: those were settled when they were handed over, and charging them
+	// again would charge a collector for being careful.
+	OutcomeAcknowledged Outcome = "acknowledged"
 )
 
 // Settlement is what an operation actually cost.

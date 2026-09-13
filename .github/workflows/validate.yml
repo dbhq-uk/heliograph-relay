@@ -12,7 +12,11 @@ jobs:
   go:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth 0, because scripts/released-contract.sh extracts the suite
+      # from the last release tag and a shallow clone has no tags to find.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.1'
@@ -45,6 +49,10 @@ jobs:
           curl -sf http://localhost:8097/health || { cat /tmp/heliograph-relay.log; exit 1; }
           go run ./cmd/conformance -restart ./scripts/restart-go-relay.sh \
             http://localhost:8097 "go binary, durable"
+          # And the contract as it was at the last release, unchanged, because a
+          # station already deployed speaks that one and is not recompiled when
+          # this repository is.
+          ./scripts/released-contract.sh http://localhost:8097 "go binary"
 
       - name: no dependencies at all
         # This server has none and should never have any. It stores bytes and
@@ -135,6 +143,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.1'
@@ -184,6 +194,14 @@ jobs:
         run: |
           go run ./cmd/conformance -restart ./scripts/restart-worker.sh \
             http://localhost:8787 "cloudflare worker, durable"
+
+      - name: the contract as it was at the last release, unchanged
+        # conformance/ moves with the code, so a change that alters the wire and
+        # updates the suite in the same commit passes it. Every station already
+        # deployed speaks the RELEASED contract and is not recompiled when this
+        # repository is, so the released suite is extracted from its tag and run
+        # as it was.
+        run: ./scripts/released-contract.sh http://localhost:8787 "cloudflare worker"
 
       - name: start a second worker behind a remote authoriser
         # The seam the hosted service lives behind. A seam nobody has run the

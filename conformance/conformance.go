@@ -221,6 +221,9 @@ func (t Target) putR(estate, station, dir, tok string, seq uint64, body []byte) 
 }
 
 type msg struct {
+	// ID is stable for the life of the message, including across a redelivery,
+	// which is what a collector deduplicates on.
+	ID   string `json:"id"`
 	Seq  uint64 `json:"seq"`
 	Body []byte `json:"body"`
 }
@@ -655,7 +658,244 @@ func Run(t Target) []Result {
 	ok("wait=0 returns immediately rather than holding the line",
 		time.Since(start) < 5*time.Second, time.Since(start).String())
 
+	out = append(out, t.leasing(uniq)...)
 	out = append(out, t.durability(uniq)...)
+	return out
+}
+
+// leaseReply is the answer to a collection that asked for a lease. A different
+// shape from a plain collection, and deliberately so: a client that has to
+// acknowledge needs something to acknowledge with, and a bare array has nowhere to
+// put it.
+type leaseReply struct {
+	Lease    string `json:"lease"`
+	Until    string `json:"until"`
+	Messages []msg  `json:"messages"`
+}
+
+func (t Target) takeLeased(estate, station, dir, tok, lease string) (int, leaseReply, error) {
+	resp, b, err := t.do("GET", t.url(estate, station, dir, "wait=0&lease="+lease), tok, nil)
+	if err != nil {
+		return 0, leaseReply{}, err
+	}
+	var out leaseReply
+	_ = json.Unmarshal(b, &out)
+	return resp.StatusCode, out, nil
+}
+
+func (t Target) ack(estate, station, dir, tok, lease string) (int, int, error) {
+	payload, _ := json.Marshal(map[string]string{"lease": lease})
+	u := fmt.Sprintf("%s/v1/%s/%s/%s/ack", strings.TrimRight(t.BaseURL, "/"), estate, station, dir)
+	resp, b, err := t.do("POST", u, tok, payload)
+	if err != nil {
+		return 0, 0, err
+	}
+	var out struct {
+		Deleted int `json:"deleted"`
+	}
+	_ = json.Unmarshal(b, &out)
+	return resp.StatusCode, out.Deleted, nil
+}
+
+// leasing asserts the collection semantics that close the loss window.
+//
+// Delete-on-collection hands the message over and forgets it in the same breath,
+// so the gap between the relay's delete and the collector's durable write is a
+// place a message can be lost - and on this transport it is frequently the only
+// copy of a capture from a machine nobody can log into. A lease holds the message
+// until the collector says it has it.
+//
+// Every assertion here is observable to a client, which is why they belong in the
+// contract rather than in one implementation's tests. What is NOT here: whether a
+// lease survives the relay being torn down. The Worker keeps leases in Durable
+// Object storage and they do; the Go server keeps them in memory and they do not.
+// Both satisfy the contract, because both fail towards redelivery rather than
+// towards loss, and the stable message id is what makes redelivery safe.
+func (t Target) leasing(uniq string) []Result {
+	var out []Result
+	ok := func(name string, cond bool, why string) {
+		out = append(out, Result{Name: name, OK: cond, Why: why})
+	}
+
+	// --- the compatibility guarantee, first, because it is the load-bearing one
+	// Every station already deployed fetches without ?lease= and parses a bare
+	// array. If that changed, this suite passing would mean nothing.
+	plain := uniq + "-plain"
+	if code, err := t.put(t.Estate, plain, "c2s", t.Control, 1, []byte("plain")); code != 202 {
+		ok("a collection without a lease is unchanged", false, fmt.Sprintf("put %d %v", code, err))
+		return out
+	}
+	code, got, err := t.take(t.Estate, plain, "c2s", t.StationTok)
+	ok("a collection without a lease answers with a bare array of messages",
+		code == 200 && len(got) == 1 && bytes.Equal(got[0].Body, []byte("plain")),
+		fmt.Sprintf("got %d, %d messages (err %v)", code, len(got), err))
+	_, again, _ := t.take(t.Estate, plain, "c2s", t.StationTok)
+	ok("a collection without a lease still deletes what it returned", len(again) == 0,
+		fmt.Sprintf("got %d", len(again)))
+	ok("every message carries an id, leased or not", len(got) == 1 && got[0].ID != "",
+		fmt.Sprintf("got %+v", got))
+
+	// lease=0 means what its absence means, so a client building a query string
+	// from a variable does not change semantics by leaving it empty.
+	zero := uniq + "-zero"
+	_, _ = t.put(t.Estate, zero, "c2s", t.Control, 1, []byte("zero"))
+	code, got, err = t.take(t.Estate, zero, "c2s", t.StationTok) // take() sends no lease
+	okZero := code == 200 && len(got) == 1
+	resp, b, err2 := t.do("GET", t.url(t.Estate, zero, "c2s", "wait=0&lease=0"), t.StationTok, nil)
+	var arr []msg
+	parsedArray := err2 == nil && resp != nil && json.Unmarshal(b, &arr) == nil
+	ok("lease=0 answers as a collection with no lease at all", okZero && parsedArray,
+		fmt.Sprintf("plain %d/%d err=%v, lease=0 body=%s", code, len(got), err, string(b)))
+
+	// --- a lease holds the message ------------------------------------------
+	held := uniq + "-held"
+	want := []byte{0x00, 0xff, 'l', 'e', 'a', 's', 'e', 0xfe}
+	if code, err := t.put(t.Estate, held, "c2s", t.Control, 3, want); code != 202 {
+		ok("a leased collection holds the message", false, fmt.Sprintf("put %d %v", code, err))
+		return out
+	}
+	code, lease, err := t.takeLeased(t.Estate, held, "c2s", t.StationTok, "30s")
+	leased := code == 200 && lease.Lease != "" && lease.Until != "" && len(lease.Messages) == 1
+	ok("a leased collection answers with a lease id, a deadline and the messages", leased,
+		fmt.Sprintf("got %d, lease=%q until=%q, %d messages (err %v)",
+			code, lease.Lease, lease.Until, len(lease.Messages), err))
+	if !leased {
+		return out
+	}
+	ok("a leased message is byte for byte what was sent", bytes.Equal(lease.Messages[0].Body, want),
+		fmt.Sprintf("got %v", lease.Messages[0].Body))
+	ok("a leased message carries an id", lease.Messages[0].ID != "", "")
+
+	// Nobody else may have it, with or without asking for a lease of their own.
+	_, second, _ := t.takeLeased(t.Estate, held, "c2s", t.StationTok, "30s")
+	ok("a message under a live lease is not handed to a second collector",
+		len(second.Messages) == 0, fmt.Sprintf("got %d", len(second.Messages)))
+	// And an empty leased collection says so in BOTH fields, identically on both
+	// implementations. The Go server marshalled its zero time here and the Worker
+	// sent an empty string, which is drift in a field a client reads: a collector
+	// that trusted `until` would have been handed year 1 by one relay and nothing
+	// by the other. Found by driving them with curl rather than by a test, which
+	// is why there is now a test.
+	ok("an empty leased collection says so in both fields",
+		second.Lease == "" && second.Until == "",
+		fmt.Sprintf("lease=%q until=%q", second.Lease, second.Until))
+	_, plainSteal, _ := t.take(t.Estate, held, "c2s", t.StationTok)
+	ok("a message under a live lease is not handed to a collection with no lease",
+		len(plainSteal) == 0, fmt.Sprintf("got %d", len(plainSteal)))
+
+	// --- acknowledging deletes it -------------------------------------------
+	code, deleted, err := t.ack(t.Estate, held, "c2s", t.StationTok, lease.Lease)
+	ok("acknowledging a lease deletes what it held", code == 200 && deleted == 1,
+		fmt.Sprintf("got %d, deleted %d (err %v)", code, deleted, err))
+	_, after, _ := t.take(t.Estate, held, "c2s", t.StationTok)
+	ok("an acknowledged message is not delivered again", len(after) == 0,
+		fmt.Sprintf("got %d", len(after)))
+
+	// A repeat of an acknowledgement that already worked, which is what a
+	// collector retrying a request whose response it never saw sends. 410: the
+	// route exists and the lease is what is gone.
+	code, _, _ = t.ack(t.Estate, held, "c2s", t.StationTok, lease.Lease)
+	ok("an acknowledgement the relay is not holding is refused with 410", code == 410,
+		fmt.Sprintf("got %d", code))
+	code, _, _ = t.ack(t.Estate, held, "c2s", t.StationTok, "definitely-not-a-lease")
+	ok("an acknowledgement of a lease that never existed is refused with 410", code == 410,
+		fmt.Sprintf("got %d", code))
+	code, _, _ = t.ack(t.Estate, held, "c2s", "", lease.Lease)
+	ok("an acknowledgement with no token is refused", code == 401, fmt.Sprintf("got %d", code))
+	if t.OtherEstate != "" {
+		code, _, _ = t.ack(t.OtherEstate, held, "c2s", t.StationTok, lease.Lease)
+		ok("one estate's token cannot acknowledge another's lease", code == 401,
+			fmt.Sprintf("got %d", code))
+	}
+
+	// --- an abandoned lease comes back --------------------------------------
+	// The assertion the whole change exists for: a collector that dies before
+	// acknowledging does not take the message with it.
+	dying := uniq + "-dying"
+	_, _ = t.put(t.Estate, dying, "c2s", t.Control, 9, []byte("an hour of capture"))
+	_, short, _ := t.takeLeased(t.Estate, dying, "c2s", t.StationTok, "1s")
+	if len(short.Messages) != 1 {
+		ok("an unacknowledged lease returns the messages when it expires", false,
+			fmt.Sprintf("the first collection got %d messages", len(short.Messages)))
+		return out
+	}
+	// No acknowledgement. The collector is gone.
+	time.Sleep(1500 * time.Millisecond)
+	_, back, _ := t.takeLeased(t.Estate, dying, "c2s", t.StationTok, "30s")
+	ok("an unacknowledged lease returns the messages when it expires",
+		len(back.Messages) == 1, fmt.Sprintf("got %d", len(back.Messages)))
+	if len(back.Messages) == 1 {
+		// The same id, which is what lets a collector recognise a retry rather
+		// than spooling the same capture twice. Without it, deduplication at the
+		// collector has nothing to key on.
+		ok("a redelivered message keeps the id it had", back.Messages[0].ID == short.Messages[0].ID,
+			fmt.Sprintf("%q then %q", short.Messages[0].ID, back.Messages[0].ID))
+		ok("a redelivered message is under a new lease", back.Lease != short.Lease,
+			fmt.Sprintf("both %q", back.Lease))
+	}
+
+	// --- the long poll, under a lease ---------------------------------------
+	// The combination a real collector uses: wait for a message and hold it. Both
+	// halves are asserted separately above and in the poll section, and a relay
+	// that woke from the poll and then answered as though no lease had been asked
+	// for would pass both of those and still lose the message.
+	poll := uniq + "-leasepoll"
+	woke := make(chan leaseReply, 1)
+	go func() {
+		resp, b, err := t.do("GET", t.url(t.Estate, poll, "c2s", "lease=30s"), t.StationTok, nil)
+		if err != nil || resp.StatusCode != 200 {
+			woke <- leaseReply{}
+			return
+		}
+		var got leaseReply
+		_ = json.Unmarshal(b, &got)
+		woke <- got
+	}()
+	time.Sleep(400 * time.Millisecond)
+	_, _ = t.put(t.Estate, poll, "c2s", t.Control, 1, []byte("wake up"))
+	select {
+	case got := <-woke:
+		ok("a long poll that asked for a lease wakes holding one",
+			got.Lease != "" && len(got.Messages) == 1,
+			fmt.Sprintf("woke with lease=%q and %d messages", got.Lease, len(got.Messages)))
+		if got.Lease != "" {
+			// And it really is a lease: the message is still there to acknowledge.
+			code, deleted, _ := t.ack(t.Estate, poll, "c2s", t.StationTok, got.Lease)
+			ok("the lease from a long poll can be acknowledged", code == 200 && deleted == 1,
+				fmt.Sprintf("got %d, deleted %d", code, deleted))
+		}
+	case <-time.After(40 * time.Second):
+		ok("a long poll that asked for a lease wakes holding one", false, "it never returned")
+	}
+
+	// --- the lease parameter itself ------------------------------------------
+	// One grammar, implemented by both. A form that works against one relay and
+	// 400s against the other is the drift this suite exists to catch.
+	bad := uniq + "-badlease"
+	_, _ = t.put(t.Estate, bad, "c2s", t.Control, 1, []byte("x"))
+	allRefused := true
+	for _, v := range []string{"nonsense", "1h", "600", "1m30s", "-5s"} {
+		code, _, _ := t.takeLeased(t.Estate, bad, "c2s", t.StationTok, v)
+		if code != 400 {
+			allRefused = false
+			ok("a lease outside the grammar is refused: "+v, false, fmt.Sprintf("got %d", code))
+		}
+	}
+	ok("a lease that is unparseable or too long is refused", allRefused, "")
+	allAccepted := true
+	for _, v := range []string{"30", "30s", "500ms", "2m"} {
+		code, got, _ := t.takeLeased(t.Estate, bad, "c2s", t.StationTok, v)
+		if code != 200 {
+			allAccepted = false
+			ok("a lease inside the grammar is accepted: "+v, false, fmt.Sprintf("got %d", code))
+		}
+		if got.Lease != "" {
+			_, _, _ = t.ack(t.Estate, bad, "c2s", t.StationTok, got.Lease)
+			_, _ = t.put(t.Estate, bad, "c2s", t.Control, 1, []byte("x"))
+		}
+	}
+	ok("seconds, milliseconds and minutes are all accepted as a lease", allAccepted, "")
+
 	return out
 }
 

@@ -25,7 +25,13 @@ it("keeps an accepted message across a forced Durable Object eviction", async ()
 
   await evictDurableObject(stub(r));
 
-  expect(await take(r)).toEqual([{ seq: 7, body: CIPHERTEXT }]);
+  const got = await take(r);
+  expect(got.map((m) => ({ seq: m.seq, body: m.body }))).toEqual([
+    { seq: 7, body: CIPHERTEXT },
+  ]);
+  // And it is recognisably the same message rather than a new one, which is what
+  // a collector deduplicating on the id relies on.
+  expect(got[0].id).toBeTruthy();
 });
 
 it("keeps every queued message across the transition, in order", async () => {
