@@ -257,6 +257,70 @@ This is what lets the claim sharpen rather than weaken when an operator's
 authoriser is proprietary: **the thing that touches your ciphertext is readable,
 and the thing that is not readable never touches it.**
 
+## Authorisation leases
+
+An authoriser in front of every operation, failing closed, turns **our** outage
+into the customer's transport outage. Cached decisions expire, a newly started
+relay has no cache at all, and the fleet loses access. On a transport whose
+proposition is reaching machines when things are broken, that is the worst
+failure available, and it arrives exactly when somebody needed it.
+
+A **lease** is a bounded, scoped grant presented as the bearer credential:
+
+```
+hl1.<base64url(payload)>.<base64url(signature)>
+
+payload = {"e":"e-9f3c1a","s":["pump-01"],"r":["c2s"],"w":["s2c"],
+           "nbf":1789255130,"exp":1789255730,"ep":7,"aud":"relay.example"}
+```
+
+The relay reads it, checks scope, window, lifetime, revocation epoch and
+audience, and **makes no network call to do any of it**. So:
+
+- an existing grant runs for its stated lifetime whatever happens to the authoriser
+- **enrolment** (a station with no lease) and any **privilege increase** (a lease used outside itself) need the authoriser, and during an outage answer **503** `authoriser-unavailable`, never 401
+- a poll already held ends when its lease expires or its epoch is raised, rather than running on to its own timeout
+
+### The maximum revocation delay is 15 minutes, and that is the trade
+
+Revocation raises an estate's **epoch**. A relay that hears it refuses every
+older lease at once. A relay that never hears it keeps honouring a lease until
+that lease expires, and `MaxAuthorityLife` bounds that at **15 minutes**.
+
+**There is no lifetime that removes this.** Shorter means faster revocation and
+a harder availability dependency; longer means the reverse. The decision is
+which number to publish, and `TestTheMaximumRevocationDelayIsTheNumberWePublish`
+revokes and measures it rather than asserting it:
+
+```
+access stopped 15m0s after revocation; the published maximum is 15m0s
+```
+
+### What revocation does not do
+
+A message already handed to a station is not recalled, because it is no longer
+here. Revocation stops the next collection and ends an open poll. A command the
+station has already taken is the station's replay and request-id handling, not
+this server's. `TestRevocationDoesNotRecallAMessageAlreadyDelivered` says so.
+
+### Neither implementation can verify a lease signature, and that is stated rather than implied
+
+| | |
+|---|---|
+| **Go binary** | reads and validates every part of a lease, and refuses it as `authority-unverifiable` until an operator supplies an `AuthorityVerifier` |
+| **Worker** | recognises a lease and refuses it as `authority-unverifiable`. There is no seam to fill |
+
+There is **no cryptography in this repository**, and verifying a signature is
+cryptography. Ed25519 is the right primitive and is forbidden here; HMAC-SHA256
+could be built from `crypto/sha256` alone, and is refused twice over, because a
+relay able to verify a symmetric MAC is a relay able to **mint** any lease it
+likes, and because hand-rolling a primitive to get past the CI grep evades that
+rule rather than satisfying it.
+
+So the format, every local check and the seam are published, and the primitive
+is not chosen here. **A relay with no verifier refuses every lease**, which is
+the only safe default, and both implementations do it identically.
+
 ### Why this rather than a fork
 
 The relay a hosted operator deploys is built from this source with nothing
@@ -280,6 +344,8 @@ Beside the sentence, in a field a program can read.
 | `too-large` | 413 | over `MaxBodyBytes` |
 | `queue-full` | 429 | the recipient has stopped collecting |
 | `out-of-scope` | 401 | a credential this relay knows, used somewhere it does not reach |
+| `authority-expired` | 401 | an authorisation lease outside the window it was minted for |
+| `authority-unverifiable` | 401 | an authorisation lease whose signature nothing here can check |
 | `estate-wide-credential` | 401 | a credential too wide for a tenant that may hold several customers |
 
 The sentence is for a person and the reason is for a program, because a client

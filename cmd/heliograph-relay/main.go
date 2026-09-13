@@ -125,13 +125,29 @@ func main() {
 	// that merely declines to say. heliograph-io/heliograph-cloud#71.
 	hosted := truthy(os.Getenv("HELIOGRAPH_RELAY_HOSTED"))
 
-	// wrap applies the tenant rule, whichever authoriser answers underneath.
+	// wrap applies the tenant rule and lease recognition, whichever authoriser
+	// answers underneath.
 	wrap := func(a relay.Authoriser) relay.Authoriser {
-		if !hosted {
-			return a
+		if hosted {
+			log.Info("hosted tenant: estate-wide credentials are refused, because one estate may hold several customers")
+			a = relay.Hosted{Inner: a}
 		}
-		log.Info("hosted tenant: estate-wide credentials are refused, because one estate may hold several customers")
-		return relay.Hosted{Inner: a}
+		// Leases are recognised whether or not this relay can verify one.
+		//
+		// A station holding a valid lease, pointed at a relay that did not know
+		// what a lease was, would be told its credential was bad - and somebody
+		// would go and rotate a credential on a machine they cannot reach, for
+		// a fault that was ours. So the lease is read, and refused for the
+		// reason it was actually refused for.
+		//
+		// No verifier is supplied, because there is none to supply: verifying a
+		// signature needs a primitive validate.yml forbids, and the options are
+		// written up on heliograph-io/heliograph-cloud#75 rather than settled by
+		// relaxing the rule. Until one exists, every lease is refused, which is
+		// the only safe default.
+		log.Info("authorisation leases are recognised and refused: no verifier is configured, so every lease fails closed",
+			"maximumLeaseLife", relay.MaxAuthorityLife.String())
+		return &relay.AuthorityAuth{Inner: a}
 	}
 
 	if stations != "" {

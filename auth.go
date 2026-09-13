@@ -76,6 +76,15 @@ const (
 	// tenant where one estate may hold several customers.
 	ReasonEstateWide Reason = "estate-wide-credential"
 
+	// ReasonAuthorityExpired is an authorisation lease outside its own window,
+	// in either direction, or one longer than this relay will honour.
+	ReasonAuthorityExpired Reason = "authority-expired"
+
+	// ReasonAuthorityUnverifiable is a lease whose signature nothing here can
+	// check. It answers 401 because the safe reading is that the lease is not
+	// genuine, even when the real cause is a relay with no verifier configured.
+	ReasonAuthorityUnverifiable Reason = "authority-unverifiable"
+
 	// About us, not about the caller. These answer 503, and that difference is
 	// the whole point of the type.
 	ReasonAuthoriserUnavailable Reason = "authoriser-unavailable"
@@ -131,6 +140,10 @@ func (r Reason) Detail() string {
 		return "this credential is not scoped to that station and direction"
 	case ReasonEstateWide:
 		return "this tenant refuses estate-wide credentials"
+	case ReasonAuthorityExpired:
+		return "this authorisation lease is outside the window it was minted for"
+	case ReasonAuthorityUnverifiable:
+		return "this authorisation lease could not be verified"
 	case ReasonRevoked:
 		return "the authority for this request was withdrawn while it was open"
 	case ReasonAuthoriserUnavailable:
