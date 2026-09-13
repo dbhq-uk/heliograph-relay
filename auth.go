@@ -88,6 +88,11 @@ const (
 	// About us, not about the caller. These answer 503, and that difference is
 	// the whole point of the type.
 	ReasonAuthoriserUnavailable Reason = "authoriser-unavailable"
+	// ReasonNotDurable is the other 503, and it is a separate reason because the
+	// two send an operator to opposite places: one to a control plane, one to a
+	// disk. The relay could not write the message where it promised to, so it has
+	// NOT accepted it - see relay.go's ErrNotDurable.
+	ReasonNotDurable Reason = "not-durable"
 
 	// ReasonRevoked is authority withdrawn while something was still open. It
 	// answers 401 because it IS about the credential, and it is separate from
@@ -113,7 +118,7 @@ func (r Reason) Status() int {
 	switch r {
 	case ReasonAllowed:
 		return http.StatusOK
-	case ReasonAuthoriserUnavailable:
+	case ReasonAuthoriserUnavailable, ReasonNotDurable:
 		return http.StatusServiceUnavailable
 	case ReasonQueueFull:
 		return http.StatusTooManyRequests
@@ -148,6 +153,8 @@ func (r Reason) Detail() string {
 		return "the authority for this request was withdrawn while it was open"
 	case ReasonAuthoriserUnavailable:
 		return "the authoriser could not be reached, so this request was neither allowed nor refused"
+	case ReasonNotDurable:
+		return ErrNotDurable.Error()
 	case ReasonBadRoute:
 		return "a message must name an estate, a station and a direction of c2s or s2c"
 	case ReasonUnreadable:

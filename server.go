@@ -183,18 +183,32 @@ func (s *Server) Routes() *http.ServeMux {
 	return mux
 }
 
-// health is what a monitoring check hits, and it now carries the two things
-// such a check has no other way to learn: which version is answering, and the
-// hash of the artefact answering.
+// health is what a monitoring check hits, and it carries the three things such a
+// check has no other way to learn: which version is answering, the hash of the
+// artefact answering, and which storage guarantee this deployment gives.
 //
 // `ok` stays first and stays a boolean, because something out there is already
 // looking for it and this endpoint is not the place to make somebody's alert
 // stop working.
+//
+// `durable` is the lesson of a published claim that was false for the
+// implementation actually deployed: the documentation said messages were never
+// written to disk while the deployed relay wrote every one of them, and nobody
+// could tell by asking. It belongs beside `hash` for the same reason `hash` is
+// here - both turn a sentence somebody has to trust into a value they can read.
+//
+// "durable": true means an accepted message survives this process. It does not
+// say where it is kept, because that is the operator's business, and the storage
+// model is asserted in each implementation's own tests rather than over HTTP.
+//
+// No token, for the same reason /version needs none: a claim you need a
+// credential to check is a claim people take on trust.
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{
 		"ok":      true,
 		"version": s.reportedVersion(),
 		"hash":    s.reportedHash(),
+		"durable": s.store.Durable(),
 	})
 }
 
@@ -395,7 +409,26 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrBadRoute):
 		refuse(w, Grant{Reason: ReasonBadRoute, Detail: err.Error()})
 		return
+	case errors.Is(err, ErrNotDurable):
+		// 503 rather than 500, and for the same reason a full queue is a 429:
+		// this is a condition the sender should retry, not a fault it should go
+		// looking for on this side. A full disk or a read-only volume is
+		// temporary in exactly the way a bug is not.
+		//
+		// Its own reason rather than reusing authoriser-unavailable, which is the
+		// other 503. Both mean "not now", and an operator reading one of them
+		// looks at a disk while the other sends them to a control plane. A status
+		// code that cannot tell those apart is the defect Reason exists to fix.
+		//
+		// The detail goes to the log as well as the client. An operator needs the
+		// path and the errno; a sender needs to know only that the relay does not
+		// have the message, so it must keep its own copy.
+		s.log.Error("put refused: not durable", "estate", estate, "station", station,
+			"dir", dir, "err", err)
+		refuse(w, Grant{Reason: ReasonNotDurable})
+		return
 	case err != nil:
+		s.log.Error("put failed", "estate", estate, "station", station, "dir", dir, "err", err)
 		refuse(w, Grant{Reason: ReasonInternal})
 		return
 	}

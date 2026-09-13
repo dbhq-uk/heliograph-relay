@@ -85,6 +85,8 @@ const usage = `heliograph-relay - stores and forwards ciphertext it cannot read
                                and HELIOGRAPH_RELAY_ESTATES is not read
   HELIOGRAPH_RELAY_HOSTED      refuse any credential not scoped to named
                                stations, including one that declines to say
+  HELIOGRAPH_RELAY_SPOOL       directory for durable messages (default: none,
+                               so a restart drops what was not collected)
 
 Example:
 
@@ -231,6 +233,33 @@ func truthy(v string) bool {
 // serve runs the server until a signal, whichever authoriser it was handed.
 func serve(auth relay.Authoriser, log *slog.Logger, estates int) {
 	store := relay.NewStore()
+
+	// Durable, if the operator has said where. An accepted message is written
+	// before the sender is told it was accepted, so a 202 means the message
+	// survives this process. Without it the relay behaves exactly as it always
+	// has, and says so at startup rather than leaving the operator to infer which
+	// guarantee they have.
+	if dir := strings.TrimSpace(os.Getenv("HELIOGRAPH_RELAY_SPOOL")); dir != "" {
+		report, err := store.OpenSpool(dir)
+		if err != nil {
+			// Refusing to start beats starting non-durable after being asked for
+			// durability. An operator who discovers it after a restart lost a
+			// capture discovers it too late.
+			fmt.Fprintf(os.Stderr, "heliograph-relay: cannot use %s as a spool: %v\n", dir, err)
+			os.Exit(2)
+		}
+		log.Info("durable", "spool", report.Dir,
+			"recovered", report.Messages, "bytes", report.Bytes)
+		for _, q := range report.Quarantined {
+			// Named rather than counted. These bytes may be the only remaining
+			// copy of something, and nobody can look at a file they are not told
+			// about.
+			log.Error("spool file did not parse as a message and was moved aside", "file", q)
+		}
+	} else {
+		log.Info("not durable", "reason", "HELIOGRAPH_RELAY_SPOOL is unset, so a restart drops what has not been collected")
+	}
+
 	go func() {
 		for range time.Tick(time.Hour) {
 			if dropped := store.Sweep(); dropped > 0 {
