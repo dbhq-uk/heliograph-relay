@@ -112,6 +112,13 @@ Held only until collected, or seven days, whichever comes first. See the Storage
 section of the [README](README.md) for what each implementation actually does,
 including where they differ, because they do.
 
+**Both can hold it durably, and for the Go binary that is now a deployment
+choice.** The Worker writes to Durable Object storage; the Go binary writes one
+file per message to `HELIOGRAPH_RELAY_SPOOL` when that is set, and holds messages
+in memory only when it is not. Durable means written before the sender is told the
+message was accepted, and deleted on collection or at seven days, whichever comes
+first. It does not mean archived, and there is no second copy anywhere.
+
 Each claim there is asserted in that implementation's own tests -
 `storage_test.go` for the Go server, `edge/test/storage-model.test.ts` for the
 Worker. Not in `conformance/`, which is asserted over HTTP: a storage model is
@@ -133,4 +140,9 @@ It could **not** read a message, forge one a station will accept, or cause a
 station to run anything, because all three need key material it does not have.
 
 If you need the metadata half covered too, run your own. That is why it is one
-container with no keys and no state worth backing up.
+container with no keys, and no state worth backing up: a spool holds ciphertext
+nobody here can read, only until the recipient has it. Losing it loses the
+messages not yet collected, which is an availability cost; reading it reveals
+nothing, because the bodies are sealed and the keys are not here. A backup would
+protect against the first and extend the exposure of the second, which is why the
+window is shortened instead.
