@@ -66,6 +66,16 @@ const (
 	ReasonBadCredential  Reason = "bad-credential"
 	ReasonWrongDirection Reason = "wrong-direction"
 
+	// ReasonOutOfScope is a credential this relay knows, used somewhere it does
+	// not reach. Separate from bad-credential because the two send an operator
+	// to different places: one is a console misconfiguration, the other is a
+	// credential on a machine nobody can get to.
+	ReasonOutOfScope Reason = "out-of-scope"
+
+	// ReasonEstateWide is a credential that covers a whole estate, refused by a
+	// tenant where one estate may hold several customers.
+	ReasonEstateWide Reason = "estate-wide-credential"
+
 	// About us, not about the caller. These answer 503, and that difference is
 	// the whole point of the type.
 	ReasonAuthoriserUnavailable Reason = "authoriser-unavailable"
@@ -117,6 +127,10 @@ func (r Reason) Detail() string {
 	switch r {
 	case ReasonWrongDirection:
 		return "not authorised to write that direction for this estate"
+	case ReasonOutOfScope:
+		return "this credential is not scoped to that station and direction"
+	case ReasonEstateWide:
+		return "this tenant refuses estate-wide credentials"
 	case ReasonRevoked:
 		return "the authority for this request was withdrawn while it was open"
 	case ReasonAuthoriserUnavailable:
@@ -163,6 +177,15 @@ type Grant struct {
 	// has to be reserved before the bytes move and charged after, or two
 	// concurrent writes each see room for one and both take it.
 	Ref string
+
+	// Scope is what this credential covers, as the authoriser understands it.
+	//
+	// The relay has already applied it by the time a Grant is returned, so this
+	// is not a second gate. It is here so a wrapper can refuse a grant for
+	// being too WIDE, which is what Hosted does: a credential covering a whole
+	// estate is correct for a self-hoster and is a tenant boundary failure for
+	// anybody whose account holds more than one customer.
+	Scope Scope
 }
 
 // Admission decides whether an attempt may proceed, and reserves what it will
@@ -296,14 +319,19 @@ func (ad authAdapter) Admit(_ context.Context, req Request) Grant {
 	if req.Credential == "" {
 		return Grant{Reason: ReasonNoCredential}
 	}
+	// A boolean Auth has no notion of a station, so anything it allows is
+	// allowed estate-wide. Saying that in the Grant rather than leaving it
+	// blank is what lets Hosted refuse it for the right reason.
+	wide := Scope{Estate: req.Estate, AllStations: true,
+		Read: []string{"c2s", "s2c"}, Write: []string{req.Dir}}
 	switch req.Op {
 	case OpRead:
 		if ad.auth.AllowRead(req.Credential, req.Estate, req.Station, req.Dir) {
-			return Grant{Allow: true}
+			return Grant{Allow: true, Scope: wide}
 		}
 	case OpWrite:
 		if ad.auth.AllowWrite(req.Credential, req.Estate, req.Station, req.Dir) {
-			return Grant{Allow: true}
+			return Grant{Allow: true, Scope: wide}
 		}
 		// A credential that may READ this queue but not write this direction is
 		// a scope refusal, not an unknown credential. Saying which costs one

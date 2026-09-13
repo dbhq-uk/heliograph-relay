@@ -75,6 +75,14 @@ type Target struct {
 	// reporting a pass nobody earned.
 	ControlPlane func() (restore func())
 
+	// Tenancy says the relay under test is a hosted tenant whose authoriser
+	// knows the credentials named by the Tenant constants below.
+	//
+	// Setting it turns on the per-station isolation section. Leaving it unset
+	// skips that section and says so, rather than reporting a pass nobody
+	// earned.
+	Tenancy bool
+
 	// AuthoriserSaw returns everything the harness's control plane has been
 	// sent since the run began, concatenated and unmodified.
 	//
@@ -85,6 +93,28 @@ type Target struct {
 	// authoriser was given and fail if the pattern is in there.
 	AuthoriserSaw func() []byte
 }
+
+// The tenancy this contract uses when a harness supplies one.
+//
+// Two customers under ONE estate identifier, which is the case that breaks an
+// estate-wide credential: an account can hold more than one customer, and a
+// station identifier is a name in a URL rather than a secret. Named here rather
+// than in each harness so the two implementations are configured from one
+// source and cannot quietly disagree about what is being tested.
+//
+// heliograph-io/heliograph-cloud#71.
+const (
+	TenantEstate       = "e-tenancy"
+	TenantAlpha        = "alpha-01"
+	TenantBravo        = "bravo-07"
+	TenantAlphaControl = "alpha-control-credential"
+	TenantAlphaStation = "alpha-station-credential"
+	TenantBravoControl = "bravo-control-credential"
+	TenantBravoStation = "bravo-station-credential"
+	// TenantWide is a credential the authoriser answers estate-wide for. A
+	// hosted tenant must refuse it, and must say that is why.
+	TenantWide = "estate-wide-credential"
+)
 
 // refusal is what a relay says when it says no.
 //
@@ -375,6 +405,71 @@ func Run(t Target) []Result {
 			len(saw) > 0, fmt.Sprintf("the authoriser was sent %d bytes", len(saw)))
 	} else {
 		ok("SKIPPED: the authoriser body check needs a control plane this harness did not supply",
+			true, "")
+	}
+
+	// --- one account, two customers ---------------------------------------
+	// heliograph-io/heliograph-cloud#71. An estate-wide credential is correct
+	// for a self-hoster, where one estate is one customer, and is a tenant
+	// boundary failure the moment an account holds two. This section is the
+	// test that tries: every combination of the two customers' identifiers,
+	// station names and directions, with alpha's credentials.
+	if t.Tenancy {
+		crossed := ""
+		wrongReason := ""
+		for _, c := range []struct{ cred, station, dir string }{
+			// alpha's station credential, against bravo.
+			{TenantAlphaStation, TenantBravo, "c2s"},
+			{TenantAlphaStation, TenantBravo, "s2c"},
+			// alpha's control credential, against bravo. Scoping only the
+			// station side leaves the half that can queue a COMMAND unbounded,
+			// and a command is code execution inside somebody else's estate.
+			{TenantAlphaControl, TenantBravo, "c2s"},
+			{TenantAlphaControl, TenantBravo, "s2c"},
+			// and bravo's, against alpha, because a hole is rarely one-sided.
+			{TenantBravoStation, TenantAlpha, "c2s"},
+			{TenantBravoStation, TenantAlpha, "s2c"},
+			{TenantBravoControl, TenantAlpha, "c2s"},
+		} {
+			where := fmt.Sprintf("%s %s/%s", c.cred, c.station, c.dir)
+			code, why, _ := t.putR(TenantEstate, c.station, c.dir, c.cred, 1, []byte("forged"))
+			if code == 202 {
+				crossed = "WROTE " + where
+			} else if why.Reason != "out-of-scope" {
+				wrongReason = where + " refused as " + why.Reason
+			}
+			code, _, _ = t.take(TenantEstate, c.station, c.dir, c.cred)
+			if code == 200 {
+				crossed = "READ " + where
+			}
+		}
+		ok("a credential from one customer cannot reach another's queues", crossed == "", crossed)
+		ok("crossing a customer boundary is refused as out-of-scope, not as a bad credential",
+			wrongReason == "", wrongReason)
+
+		// And each customer still does its own work, or the section above
+		// proves only that everything is broken.
+		code, _ = t.put(TenantEstate, TenantAlpha, "c2s", TenantAlphaControl, 1, []byte("alpha's own"))
+		ok("a control credential still queues for its own station", code == 202, fmt.Sprintf("got %d", code))
+		code, got, _ = t.take(TenantEstate, TenantAlpha, "c2s", TenantAlphaStation)
+		ok("a station credential still collects its own requests", code == 200 && len(got) == 1,
+			fmt.Sprintf("got %d with %d messages", code, len(got)))
+		code, _ = t.put(TenantEstate, TenantAlpha, "s2c", TenantAlphaStation, 1, []byte("alpha's status"))
+		ok("a station credential still publishes its own status", code == 202, fmt.Sprintf("got %d", code))
+
+		// The direction asymmetry survives scoping. A station credential must
+		// still not queue a request, even for its own station.
+		code, _ = t.put(TenantEstate, TenantAlpha, "c2s", TenantAlphaStation, 1, []byte("evil"))
+		ok("a station credential still may NOT queue a request for its own station",
+			code != 202, fmt.Sprintf("got %d", code))
+
+		// The estate-wide credential, which is the one #71 is named after.
+		code, why, _ := t.putR(TenantEstate, TenantAlpha, "c2s", TenantWide, 1, []byte("x"))
+		ok("a hosted tenant refuses an estate-wide credential", code != 202, fmt.Sprintf("got %d", code))
+		ok("and says estate-wide is why, rather than reporting a bad credential",
+			why.Reason == "estate-wide-credential", fmt.Sprintf("reason=%q", why.Reason))
+	} else {
+		ok("SKIPPED: the per-station isolation section needs a tenancy this harness did not supply",
 			true, "")
 	}
 

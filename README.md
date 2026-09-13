@@ -120,14 +120,74 @@ certificates would be a bigger thing to audit for no gain.
 |---|---|
 | `HELIOGRAPH_RELAY_ADDR` | listen address, default `:8080` |
 | `HELIOGRAPH_RELAY_ESTATES` | `estate:controlToken:stationToken`, comma separated |
+| `HELIOGRAPH_RELAY_STATIONS` | `estate:station:role:credential`, comma separated. `role` is `control` or `station`. Per-station scope |
 | `HELIOGRAPH_RELAY_AUTHORISER` | a URL that answers authorisation decisions. When set, estates are that service's business and `HELIOGRAPH_RELAY_ESTATES` is not read |
+| `HELIOGRAPH_RELAY_HOSTED` | refuse any credential not scoped to named stations, including one that declines to say |
 
-It **refuses to start** with neither configured. Starting and answering 401
+It **refuses to start** with none of the three configured. Starting and answering 401
 to everything looks exactly like a credential problem at the far end, and sends
 the reader to the wrong side of the gap.
 
 It also refuses an estate whose two tokens are identical, since that collapses
 the only scope separation there is.
+
+## One relay, more than one customer
+
+`HELIOGRAPH_RELAY_ESTATES` scopes a credential to an **estate**, and in both
+directions: either side may read either queue of its own estate. That is right
+when one estate is one customer, which is the self-hosted case.
+
+**It is wrong the moment an account holds two.** Put two customers under one
+estate identifier and a station credential lifted from a machine at one of them
+reads the other's queues and writes fabricated replies into the other's reply
+queue. Direction restrictions do not provide station isolation, and a station
+name is not a secret: it travels in a URL and appears in logs.
+
+So `HELIOGRAPH_RELAY_STATIONS` scopes one level narrower, per station:
+
+```bash
+HELIOGRAPH_RELAY_STATIONS="\
+e-9f3c1a:pump-01:station:$ALPHA_STN,\
+e-9f3c1a:pump-01:control:$ALPHA_CTL,\
+e-2b7d44:till-07:station:$BRAVO_STN,\
+e-2b7d44:till-07:control:$BRAVO_CTL"
+```
+
+A control credential covering a group is listed once per station. The direction
+asymmetry is unchanged and survives scoping: a `station` role reads `c2s` and
+writes `s2c`, so it still cannot queue a request even for its own station.
+
+**Nothing is permitted by omission.** A scope that matched by leaving a field
+blank is how an estate-wide credential ends up in a multi-customer tenant by
+accident, and the accident is silent until somebody reads somebody else's logs.
+A malformed entry is refused by name rather than skipped, because a skipped
+entry fails closed and is far harder to diagnose than a refusal.
+
+### The identifier in the first path segment
+
+For a tenant carrying several customers it is **opaque, minted per station at
+enrolment, and kept for that station's life**. It is derived from nothing and is
+never treated as a secret.
+
+One identifier per account has fewer moving parts and was rejected. The
+identifier is written into a machine's configuration when the operator plants
+it, and that machine is one nobody can reach, so a per-account identifier makes
+every reorganisation a job of reaching machines. Per station, renaming a group,
+nesting it differently or moving a whole group to another account is a record
+change on the authoriser's side and **no station configuration changes at all**.
+
+`TestMovingAGroupBetweenAccountsChangesNoStationConfiguration` is that claim
+asserted rather than described.
+
+### `HELIOGRAPH_RELAY_HOSTED`
+
+Set it and the relay refuses any credential it cannot prove is scoped to named
+stations, with `"reason":"estate-wide-credential"`.
+
+**Silence is refused as firmly as an explicit estate-wide grant.** An authoriser
+that answers "allow" without saying what for has not said the credential is
+station-scoped, and reading silence as the safe answer is how this class of hole
+gets created in the first place.
 
 ## Bring your own authoriser
 
@@ -140,8 +200,17 @@ POST https://authz.example/decide
 {"credential":"...","estate":"e1","station":"st1","dir":"c2s","op":"write","bytes":812}
 
 200 OK
+{"allow":true,"scope":{"estate":"e1","stations":["st1"],"allStations":false,
+                       "read":["s2c"],"write":["c2s"]}}
+
+200 OK
 {"allow":false,"reason":"wrong-direction","detail":"optional sentence for the caller"}
 ```
+
+`scope` is what the authoriser says the credential covers. The relay has already
+applied its own decision by then, so it is not a second gate: it is there so a
+tenant configured with `HELIOGRAPH_RELAY_HOSTED` can refuse a grant for being too
+**wide**, which is a different question from whether it covers this request.
 
 The request is routing, an operation and a length. **No body, no stream, nothing
 that could be followed to content.** `bytes` is a size, not a sample.
@@ -210,6 +279,8 @@ Beside the sentence, in a field a program can read.
 | `unreadable-request` | 400 | the envelope would not parse |
 | `too-large` | 413 | over `MaxBodyBytes` |
 | `queue-full` | 429 | the recipient has stopped collecting |
+| `out-of-scope` | 401 | a credential this relay knows, used somewhere it does not reach |
+| `estate-wide-credential` | 401 | a credential too wide for a tenant that may hold several customers |
 
 The sentence is for a person and the reason is for a program, because a client
 that has to match on English prose breaks when the prose improves.
