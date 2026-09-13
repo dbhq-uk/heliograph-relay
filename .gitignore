@@ -3,3 +3,4 @@
 /dist/
 edge/node_modules/
 edge/.wrangler/
+edge/dist/

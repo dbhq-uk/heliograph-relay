@@ -39,6 +39,20 @@ type Server struct {
 	// nobody set it, which is itself worth reporting rather than hiding:
 	// an operator who cannot tell what is deployed should be told so.
 	Version string
+
+	// Hash is the SHA-256 of the artefact that is serving, reported at
+	// /health, and it answers a different question from Version.
+	//
+	// A version is a NAME a deployment gives itself: whoever deployed can
+	// pass any string they like, and a hand-deploy did exactly that before
+	// there was a workflow. A hash is a NUMBER somebody else can arrive at,
+	// by building the same tag and comparing - which is the only form of
+	// "the relay in the path is the relay you read" that does not end in
+	// trusting the operator. See https://heliograph.dbhq.uk/provenance.
+	//
+	// Empty means nobody could work it out, and /health says "unknown"
+	// rather than an empty string, for the same reason Version does.
+	Hash string
 }
 
 // Auth decides whether a token may act on a route.
@@ -160,9 +174,19 @@ func (s *Server) Routes() *http.ServeMux {
 	return mux
 }
 
+// health is what a monitoring check hits, and it now carries the two things
+// such a check has no other way to learn: which version is answering, and the
+// hash of the artefact answering.
+//
+// `ok` stays first and stays a boolean, because something out there is already
+// looking for it and this endpoint is not the place to make somebody's alert
+// stop working.
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"ok":true}`))
+	writeJSON(w, map[string]any{
+		"ok":      true,
+		"version": s.reportedVersion(),
+		"hash":    s.reportedHash(),
+	})
 }
 
 // reportedVersion never returns an empty string. A build with no version
@@ -173,6 +197,15 @@ func (s *Server) reportedVersion() string {
 		return "unknown"
 	}
 	return s.Version
+}
+
+// reportedHash never returns an empty string, for the same reason
+// reportedVersion does not: "unknown" is a true answer somebody can act on.
+func (s *Server) reportedHash() string {
+	if s.Hash == "" {
+		return "unknown"
+	}
+	return s.Hash
 }
 
 // version exists so that "the relay you are talking to is the relay you read"

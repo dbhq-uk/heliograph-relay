@@ -142,17 +142,42 @@ func Run(t Target) []Result {
 	}
 	uniq := fmt.Sprintf("%s-%d", t.Station, time.Now().UnixNano())
 
+	base := strings.TrimRight(t.BaseURL, "/")
+
 	// --- health ---------------------------------------------------------
-	resp, _, err := t.do("GET", strings.TrimRight(t.BaseURL, "/")+"/health", "", nil)
+	//
+	// /health answers the two questions a monitoring check actually has, and
+	// they are different questions. The VERSION is the commit a deployment
+	// believes it is, which is a claim it makes about itself. The HASH is of
+	// the artefact that is serving - the Worker bundle, or the binary on
+	// disk - and that is a number anybody can arrive at independently by
+	// building the same tag, which is the only form of "the relay in the path
+	// is the relay you read" that does not end in trusting whoever deployed
+	// it. See https://heliograph.dbhq.uk/provenance.
+	resp, hbody, err := t.do("GET", base+"/health", "", nil)
 	ok("health answers without a token", err == nil && resp != nil && resp.StatusCode == 200,
 		fmt.Sprintf("err=%v", err))
+	health := struct {
+		OK      bool   `json:"ok"`
+		Version string `json:"version"`
+		Hash    string `json:"hash"`
+	}{}
+	healthParsed := err == nil && json.Unmarshal(hbody, &health) == nil
+	ok("health still says ok", healthParsed && health.OK,
+		fmt.Sprintf("body=%s", string(hbody)))
+	// Never blank, for the same reason /version is never blank: a deployment
+	// nobody stamped must SAY it does not know, because an empty field reads
+	// as a bug in whatever asked.
+	ok("health names the version that is serving", healthParsed && health.Version != "",
+		fmt.Sprintf("version=%q", health.Version))
+	ok("health names the hash of what is serving", healthParsed && health.Hash != "",
+		fmt.Sprintf("hash=%q", health.Hash))
 
 	// --- identity, and the two endpoints a human reaches for -------------
 	// Both are unauthenticated on purpose. "The relay you are talking to is
 	// the relay you read" is not checkable if you need a credential to ask
 	// which relay it is, and the answer reveals nothing a reader of the
 	// public source does not already have.
-	base := strings.TrimRight(t.BaseURL, "/")
 	for _, path := range []string{"/", "/version"} {
 		resp, body, err := t.do("GET", base+path, "", nil)
 		got := struct {
