@@ -165,6 +165,7 @@ jobs:
         run: |
           npx wrangler dev --port 8788 --inspector-port 9230 --local \
             --var HELIOGRAPH_RELAY_AUTHORISER:"http://127.0.0.1:9797/decide" \
+            --var HELIOGRAPH_RELAY_HOSTED:"1" \
             > /tmp/wrangler-authz.log 2>&1 &
           for i in $(seq 1 60); do
             curl -sf http://localhost:8788/health >/dev/null && break
@@ -172,15 +173,21 @@ jobs:
           done
           curl -sf http://localhost:8788/health || { cat /tmp/wrangler-authz.log; exit 1; }
 
-      - name: a control-plane outage is not a bad credential, at the edge too
-        # The suite runs the control plane itself, so it can take it away. The
-        # worst failure this product has is a management-plane outage reported
-        # as a credential problem: the person who reads a 401 goes to the far
-        # side of the gap, and the fault is on this side.
-        # heliograph-io/heliograph-cloud#7
+      - name: an outage is not a bad credential, and one customer is not another
+        # The suite runs the control plane itself, so it can take it away and so
+        # it can bind credentials to stations.
+        #
+        # Two assertions this step exists for. A management-plane outage
+        # reported as a credential problem sends the reader to the far side of
+        # a gap when the fault is on this side
+        # (heliograph-io/heliograph-cloud#7). And an estate-wide credential is
+        # correct for a self-hoster and a tenant boundary failure the moment an
+        # account holds two customers
+        # (heliograph-io/heliograph-cloud#71).
         env:
           HELIOGRAPH_CONF_AUTHORISER: 127.0.0.1:9797
-        run: go run ./cmd/conformance http://localhost:8788 "cloudflare worker behind a remote authoriser"
+          HELIOGRAPH_CONF_TENANCY: "1"
+        run: go run ./cmd/conformance http://localhost:8788 "cloudflare worker, hosted tenant behind a remote authoriser"
 
       - name: no cryptography in the worker either
         run: |

@@ -32,6 +32,25 @@ export interface Env {
    */
   HELIOGRAPH_RELAY_AUTHORISER?: string;
   /**
+   * estate:station:role:credential, comma separated. role is "control" or
+   * "station".
+   *
+   * Per-station scope, one level narrower than HELIOGRAPH_RELAY_ESTATES, for an
+   * operator whose one relay carries more than one customer. A credential
+   * covering several stations is listed once per station.
+   * heliograph-io/heliograph-cloud#71.
+   */
+  HELIOGRAPH_RELAY_STATIONS?: string;
+  /**
+   * Refuse any credential not scoped to named stations, including one that
+   * merely declines to say.
+   *
+   * An estate identifier is a name and never a secret: it travels in a URL and
+   * appears in logs. So a tenant whose estates may each hold more than one
+   * customer cannot treat "knows the identifier" as "may read the queue".
+   */
+  HELIOGRAPH_RELAY_HOSTED?: string;
+  /**
    * The commit this was deployed from. A var rather than a secret, because the
    * entire point is that anybody can read it and compare it against `main`.
    * Set at deploy: `wrangler deploy --var VERSION:$(git rev-parse HEAD)`.
@@ -176,6 +195,8 @@ type Reason =
   | "unreadable-request"
   | "too-large"
   | "queue-full"
+  | "out-of-scope"
+  | "estate-wide-credential"
   | "internal";
 
 const STATUS: Record<Reason, number> = {
@@ -187,6 +208,8 @@ const STATUS: Record<Reason, number> = {
   "unreadable-request": 400,
   "too-large": 413,
   "queue-full": 429,
+  "out-of-scope": 401,
+  "estate-wide-credential": 401,
   internal: 500,
 };
 
@@ -200,6 +223,8 @@ const DETAIL: Record<Reason, string> = {
   "unreadable-request": "could not read the message",
   "too-large": "message is larger than the relay will carry",
   "queue-full": "this queue is full: the recipient is not collecting",
+  "out-of-scope": "this credential is not scoped to that station and direction",
+  "estate-wide-credential": "this tenant refuses estate-wide credentials",
   internal: "could not accept the message",
 };
 
@@ -239,6 +264,99 @@ interface Grant {
   allow: boolean;
   /** Absent when allowed. A refusal always names one. */
   reason?: Reason;
+  /**
+   * What this credential covers, as the authoriser understands it. Carried so
+   * a hosted tenant can refuse a grant for being too WIDE, which is a different
+   * question from whether it covers this request.
+   */
+  scope?: Scope;
+}
+
+/**
+ * What a credential may do, and nothing is permitted by omission.
+ *
+ * Every field is a positive grant. An empty scope allows nothing at all, which
+ * is the only safe zero value: a scope that matched by leaving a field blank is
+ * how an estate-wide credential gets into a hosted tenant by accident, and the
+ * accident is silent until somebody reads somebody else's logs.
+ */
+interface Scope {
+  estate: string;
+  stations: string[];
+  /** Estate-wide. It exists so such a scope can SAY so and be refused for it. */
+  allStations: boolean;
+  read: string[];
+  write: string[];
+}
+
+function scopePermits(s: Scope, d: DecisionRequest): boolean {
+  if (!d.estate || !d.station || (d.dir !== "c2s" && d.dir !== "s2c")) return false;
+  if (!s.estate || s.estate !== d.estate) return false;
+  if (!s.allStations && !s.stations.includes(d.station)) return false;
+  return (d.op === "read" ? s.read : s.write).includes(d.dir);
+}
+
+/** A scope narrowed to named stations, which is what a hosted tenant requires. */
+function stationScoped(s: Scope | undefined): boolean {
+  return !!s && !s.allStations && s.stations.length > 0;
+}
+
+/**
+ * Per-station scopes, parsed from one configuration string.
+ *
+ * Every fault is refused rather than skipped, and the refusal names the entry.
+ * parseEstates skips a malformed estate, which fails closed and is far harder
+ * to diagnose: the relay starts, answers 401 to everything for that estate, and
+ * sends the reader to the far side of a gap they cannot cross.
+ */
+function parseStationScopes(spec: string): Map<string, Scope> {
+  const out = new Map<string, Scope>();
+  const roles = new Map<string, string>();
+  let n = 0;
+  for (const raw of (spec ?? "").split(",")) {
+    const entry = raw.trim();
+    if (entry === "") continue;
+    const parts = entry.split(":");
+    if (parts.length !== 4) {
+      throw new Error(`${entry} is not estate:station:role:credential`);
+    }
+    const [estate, station, role, credential] = parts;
+    if (!estate || !station || !credential) {
+      throw new Error(
+        `${entry} leaves estate, station or credential empty, and nothing is permitted by omission`,
+      );
+    }
+    if (role !== "control" && role !== "station") {
+      throw new Error(`${entry}: role must be "control" or "station", not ${role}`);
+    }
+    const had = roles.get(credential);
+    if (had && had !== role) {
+      throw new Error(
+        `${entry}: this credential is already the ${had} side, and one credential for both sides removes the scope separation entirely`,
+      );
+    }
+    roles.set(credential, role);
+
+    const read = role === "station" ? ["c2s"] : ["s2c"];
+    const write = role === "station" ? ["s2c"] : ["c2s"];
+    const s = out.get(credential) ?? {
+      estate,
+      stations: [],
+      allStations: false,
+      read,
+      write,
+    };
+    s.estate = estate;
+    s.read = read;
+    s.write = write;
+    if (!s.stations.includes(station)) s.stations.push(station);
+    out.set(credential, s);
+    n++;
+  }
+  if (n === 0) {
+    throw new Error("no scopes configured, so no client could ever authenticate");
+  }
+  return out;
 }
 
 /** Decisions held between requests, so an idle poll is not an authz call. */
@@ -276,12 +394,22 @@ function admitStatic(env: Env, d: DecisionRequest): Grant {
   // Reading is symmetric; writing is not. A station credential sits on a
   // machine nobody can reach and cannot be rotated quickly, so it must not be
   // able to queue a request, even for its own station.
-  if (d.op === "read") return { allow: true };
+  // A static estate has no notion of a station, so anything it allows is
+  // allowed estate-wide. Saying that in the grant rather than leaving it blank
+  // is what lets a hosted tenant refuse it for the right reason.
+  const wide: Scope = {
+    estate: d.estate,
+    stations: [],
+    allStations: true,
+    read: ["c2s", "s2c"],
+    write: [d.dir],
+  };
+  if (d.op === "read") return { allow: true, scope: wide };
   const mayWrite = d.dir === "c2s" ? isControl : isStation;
   // A good credential used in the wrong direction is not a bad credential, and
   // reporting it as one is what gets a station rotated on a machine nobody can
   // reach, for nothing.
-  return mayWrite ? { allow: true } : { allow: false, reason: "wrong-direction" };
+  return mayWrite ? { allow: true, scope: wide } : { allow: false, reason: "wrong-direction" };
 }
 
 /**
@@ -312,13 +440,26 @@ async function admitRemote(url: string, d: DecisionRequest): Promise<Grant> {
       signal: AbortSignal.timeout(3_000),
     });
     if (resp.status !== 200) return { allow: false, reason: "authoriser-unavailable" };
-    const out = (await resp.json()) as { allow?: boolean; reason?: string };
+    const out = (await resp.json()) as {
+      allow?: boolean;
+      reason?: string;
+      scope?: Partial<Scope>;
+    };
     grant = {
       allow: out.allow === true,
       // A refusal with no reason still refuses, and names itself, because a
       // blank reason would leave the caller guessing which side is broken.
       reason: (out.reason as Reason) || "bad-credential",
     };
+    if (out.scope) {
+      grant.scope = {
+        estate: out.scope.estate ?? "",
+        stations: out.scope.stations ?? [],
+        allStations: out.scope.allStations === true,
+        read: out.scope.read ?? [],
+        write: out.scope.write ?? [],
+      };
+    }
   } catch {
     return { allow: false, reason: "authoriser-unavailable" };
   }
@@ -334,11 +475,86 @@ async function admitRemote(url: string, d: DecisionRequest): Promise<Grant> {
   return grant;
 }
 
-async function admit(env: Env, d: DecisionRequest): Promise<Grant> {
-  const url = env.HELIOGRAPH_RELAY_AUTHORISER;
-  if (!url) return admitStatic(env, d);
+/**
+ * Per-station scope, read out of HELIOGRAPH_RELAY_STATIONS.
+ *
+ * Parsed once per isolate and kept, because the string does not change while
+ * the isolate lives and parsing it per request would be work in the data path
+ * for no reason.
+ */
+let scopes: Map<string, Scope> | null = null;
+let scopesFrom = "";
+let scopesError = "";
+
+function stationScopes(spec: string): Map<string, Scope> {
+  if (scopes && scopesFrom === spec) {
+    if (scopesError) throw new Error(scopesError);
+    return scopes;
+  }
+  scopesFrom = spec;
+  scopesError = "";
+  try {
+    scopes = parseStationScopes(spec);
+  } catch (e) {
+    scopes = new Map();
+    scopesError = e instanceof Error ? e.message : String(e);
+    throw e;
+  }
+  return scopes;
+}
+
+function admitScoped(spec: string, d: DecisionRequest): Grant {
   if (!d.credential) return { allow: false, reason: "no-credential" };
-  return admitRemote(url, d);
+  let known: Map<string, Scope>;
+  try {
+    known = stationScopes(spec);
+  } catch {
+    // A configuration this relay could not read is not a statement about the
+    // caller's credential, so it is not reported as one.
+    return { allow: false, reason: "internal" };
+  }
+  const s = known.get(d.credential);
+  if (!s) return { allow: false, reason: "bad-credential" };
+  if (scopePermits(s, d)) return { allow: true, scope: s };
+  // A credential this relay knows, used somewhere it does not reach. Saying
+  // "out-of-scope" rather than "bad-credential" is what stops an operator
+  // rotating a credential on a machine they cannot reach for a fault that was
+  // a console misconfiguration.
+  return { allow: false, reason: "out-of-scope" };
+}
+
+/**
+ * Refuse anything that cannot be proved scoped to named stations.
+ *
+ * Silence is refused as firmly as an explicit estate-wide grant. An authoriser
+ * that says "allow" without saying what for has not said the credential is
+ * station-scoped, and reading silence as the safe answer is how this class of
+ * hole is created.
+ */
+function hosted(g: Grant): Grant {
+  if (!g.allow || stationScoped(g.scope)) return g;
+  return { allow: false, reason: "estate-wide-credential" };
+}
+
+function truthy(v: string | undefined): boolean {
+  switch ((v ?? "").trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true;
+  }
+  return false;
+}
+
+async function admit(env: Env, d: DecisionRequest): Promise<Grant> {
+  const apply = truthy(env.HELIOGRAPH_RELAY_HOSTED) ? hosted : (g: Grant) => g;
+  const stations = (env.HELIOGRAPH_RELAY_STATIONS ?? "").trim();
+  if (stations) return apply(admitScoped(stations, d));
+  const url = env.HELIOGRAPH_RELAY_AUTHORISER;
+  if (!url) return apply(admitStatic(env, d));
+  if (!d.credential) return { allow: false, reason: "no-credential" };
+  return apply(await admitRemote(url, d));
 }
 
 /**

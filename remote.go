@@ -102,6 +102,16 @@ type decisionResponse struct {
 	Allow  bool   `json:"allow"`
 	Reason string `json:"reason"`
 	Detail string `json:"detail"`
+	// Scope is what the authoriser says this credential covers. Carried so a
+	// Hosted wrapper can refuse a grant for being too wide, which is the
+	// tenant-isolation half of heliograph-io/heliograph-cloud#71.
+	Scope *struct {
+		Estate      string   `json:"estate"`
+		Stations    []string `json:"stations"`
+		AllStations bool     `json:"allStations"`
+		Read        []string `json:"read"`
+		Write       []string `json:"write"`
+	} `json:"scope"`
 }
 
 func (a *RemoteAuth) now() time.Time {
@@ -201,6 +211,12 @@ func (a *RemoteAuth) ask(ctx context.Context, dr decisionRequest) (Grant, bool) 
 		return Grant{}, false
 	}
 	g := Grant{Allow: out.Allow, Reason: Reason(out.Reason), Detail: out.Detail}
+	if sc := out.Scope; sc != nil {
+		g.Scope = Scope{
+			Estate: sc.Estate, Stations: sc.Stations, AllStations: sc.AllStations,
+			Read: sc.Read, Write: sc.Write,
+		}
+	}
 	if !g.Allow && g.Reason == ReasonAllowed {
 		// A refusal with no reason would answer 401 by default, which is the
 		// right refusal but a poor explanation. Name it.

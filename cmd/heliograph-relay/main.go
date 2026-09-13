@@ -76,9 +76,15 @@ const usage = `heliograph-relay - stores and forwards ciphertext it cannot read
 
   HELIOGRAPH_RELAY_ADDR        listen address         (default :8080)
   HELIOGRAPH_RELAY_ESTATES     estate:controlToken:stationToken, comma separated
+  HELIOGRAPH_RELAY_STATIONS    estate:station:role:credential, comma separated.
+                               role is "control" or "station". Per-station
+                               scope, for an operator whose one relay carries
+                               more than one customer
   HELIOGRAPH_RELAY_AUTHORISER  a URL that answers authorisation decisions.
                                When set, estates are that service's business
                                and HELIOGRAPH_RELAY_ESTATES is not read
+  HELIOGRAPH_RELAY_HOSTED      refuse any credential not scoped to named
+                               stations, including one that declines to say
 
 Example:
 
@@ -113,6 +119,37 @@ func main() {
 
 	spec := os.Getenv("HELIOGRAPH_RELAY_ESTATES")
 	authoriser := strings.TrimSpace(os.Getenv("HELIOGRAPH_RELAY_AUTHORISER"))
+	stations := strings.TrimSpace(os.Getenv("HELIOGRAPH_RELAY_STATIONS"))
+	// A tenant whose estates may each hold more than one customer. Refuses any
+	// credential it cannot prove is scoped to named stations, including one
+	// that merely declines to say. heliograph-io/heliograph-cloud#71.
+	hosted := truthy(os.Getenv("HELIOGRAPH_RELAY_HOSTED"))
+
+	// wrap applies the tenant rule, whichever authoriser answers underneath.
+	wrap := func(a relay.Authoriser) relay.Authoriser {
+		if !hosted {
+			return a
+		}
+		log.Info("hosted tenant: estate-wide credentials are refused, because one estate may hold several customers")
+		return relay.Hosted{Inner: a}
+	}
+
+	if stations != "" {
+		if authoriser != "" || strings.TrimSpace(spec) != "" {
+			fmt.Fprint(os.Stderr, "heliograph-relay: HELIOGRAPH_RELAY_STATIONS cannot be combined with HELIOGRAPH_RELAY_ESTATES or HELIOGRAPH_RELAY_AUTHORISER. Two sources of truth for the same question is a configuration nobody can reason about.\n")
+			os.Exit(2)
+		}
+		scoped, err := relay.ParseStationScopes(stations)
+		if err != nil {
+			// Named and refused, rather than skipped. A skipped entry fails
+			// closed and is far harder to diagnose than a refusal that says
+			// which entry was wrong.
+			fmt.Fprintf(os.Stderr, "heliograph-relay: HELIOGRAPH_RELAY_STATIONS: %v\n", err)
+			os.Exit(2)
+		}
+		serve(wrap(scoped), log, 0)
+		return
+	}
 
 	if authoriser != "" {
 		// Somebody else's directory decides. This is how the hosted service
@@ -124,7 +161,7 @@ func main() {
 			log.Warn("HELIOGRAPH_RELAY_ESTATES is set and will not be read, because HELIOGRAPH_RELAY_AUTHORISER is set. Two sources of truth for the same question is a configuration nobody can reason about",
 				"authoriser", authoriser)
 		}
-		serve(relay.NewRemoteAuth(authoriser), log, 0)
+		serve(wrap(relay.NewRemoteAuth(authoriser)), log, 0)
 		return
 	}
 
@@ -133,7 +170,7 @@ func main() {
 		// Refusing to start beats starting with no estates and answering 401 to
 		// everything, which looks exactly like a credential problem at the far
 		// end and sends the reader to the wrong side of the gap.
-		fmt.Fprint(os.Stderr, "heliograph-relay: neither HELIOGRAPH_RELAY_ESTATES nor HELIOGRAPH_RELAY_AUTHORISER is set, so no client could ever authenticate.\n\n")
+		fmt.Fprint(os.Stderr, "heliograph-relay: none of HELIOGRAPH_RELAY_ESTATES, HELIOGRAPH_RELAY_STATIONS or HELIOGRAPH_RELAY_AUTHORISER is set, so no client could ever authenticate.\n\n")
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
@@ -159,7 +196,20 @@ func main() {
 			"station", relay.FingerprintToken(parts[2]))
 		n++
 	}
-	serve(relay.FromAuth(auth), log, n)
+	serve(wrap(relay.FromAuth(auth)), log, n)
+}
+
+// truthy reads a flag from the environment.
+//
+// Only the affirmative spellings count, so a variable set to "false" or "0" or
+// left empty leaves the flag off. A flag that turned on because somebody wrote
+// "no" would be a hosted tenant nobody meant to configure.
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // serve runs the server until a signal, whichever authoriser it was handed.
