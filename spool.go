@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,7 +32,7 @@ import (
 // unchanged, and the README says which they have.
 //
 // THE FORMAT IS DELIBERATELY BORING. One file per message: a single line of JSON
-// naming the route, the sequence number and the arrival time, then a newline,
+// naming the id, the route, the sequence number and the arrival time, then a newline,
 // then the body exactly as it arrived. Splitting on the FIRST newline only, so a
 // body containing newlines - or anything else - is carried byte for byte. The
 // body is never decoded, re-encoded or interpreted here, for the same reason
@@ -77,6 +78,10 @@ type SpoolReport struct {
 // sorts, and has no timezone to get wrong. It is the relay's own clock and is
 // used for expiry only, as everywhere else in this package.
 type spoolHead struct {
+	// ID is written because it has to survive the restart too. A collector
+	// deduplicates on it, and a message that came back with a new id after a
+	// relay restart would be indistinguishable from a second message.
+	ID      string `json:"id"`
 	Estate  string `json:"estate"`
 	Station string `json:"station"`
 	Dir     string `json:"dir"`
@@ -113,10 +118,26 @@ func (s *Store) OpenSpool(dir string) (SpoolReport, error) {
 		k := key(m.Estate, m.Station, m.Dir)
 		s.q[k] = append(s.q[k], m)
 		report.Bytes += int64(len(m.Body))
+		// Keep counting ids from the highest one recovered. Reusing an id would
+		// make two different messages look like one redelivery to a collector
+		// deduplicating on it, and the second would be dropped as a duplicate.
+		if n, ok := messageNumber(m.ID); ok && n > s.ids {
+			s.ids = n
+		}
 	}
 	report.Messages = len(msgs)
 	report.Quarantined = quarantined
 	return report, nil
+}
+
+// messageNumber reads the counter back out of an id, which is the one place the
+// id's shape is relied on. Kept next to the thing that writes it.
+func messageNumber(id string) (uint64, bool) {
+	n, err := strconv.ParseUint(strings.TrimPrefix(id, "m"), 10, 64)
+	if err != nil || !strings.HasPrefix(id, "m") {
+		return 0, false
+	}
+	return n, true
 }
 
 // load reads every message left on disk, in the order they were written.
@@ -201,6 +222,7 @@ func readSpoolFile(path string) (Message, error) {
 		return Message{}, fmt.Errorf("%s names no valid route", path)
 	}
 	return Message{
+		ID:      head.ID,
 		Estate:  head.Estate,
 		Station: head.Station,
 		Dir:     head.Dir,
@@ -221,7 +243,7 @@ func readSpoolFile(path string) (Message, error) {
 // guarantee, and this package has had enough of those.
 func (sp *spool) write(m Message) (string, error) {
 	head, err := json.Marshal(spoolHead{
-		Estate: m.Estate, Station: m.Station, Dir: m.Dir,
+		ID: m.ID, Estate: m.Estate, Station: m.Station, Dir: m.Dir,
 		Seq: m.Seq, At: m.At.UnixNano(),
 	})
 	if err != nil {

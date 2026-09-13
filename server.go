@@ -177,6 +177,10 @@ func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/{estate}/{station}/{dir}", s.put)
 	mux.HandleFunc("GET /v1/{estate}/{station}/{dir}", s.get)
+	// Acknowledging a lease is part of collecting, so it sits under the queue's
+	// own path and takes the READ scope. A station that may collect requests may
+	// confirm it has them, and still may not queue one.
+	mux.HandleFunc("POST /v1/{estate}/{station}/{dir}/ack", s.ack)
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /version", s.version)
 	mux.HandleFunc("GET /{$}", s.root)
@@ -446,6 +450,14 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// get collects, destructively by default and under a lease if asked.
+//
+// TWO RESPONSE SHAPES, AND THE REASON IS COMPATIBILITY RATHER THAN TASTE. Without
+// ?lease= the body is a bare array of messages, exactly as it has always been,
+// because every station already deployed parses that. With ?lease= it is an object
+// carrying the lease id, its deadline and the messages, because a collector that
+// has to acknowledge needs something to acknowledge with, and a bare array has
+// nowhere to put it.
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	estate, station, dir := r.PathValue("estate"), r.PathValue("station"), r.PathValue("dir")
@@ -475,6 +487,23 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("limit"); v != "" {
 		limit, _ = strconv.Atoi(v)
 	}
+	held, err := ParseLease(r.URL.Query().Get("lease"))
+	if err != nil {
+		// A refusal rather than a silent clamp or a silent fall back to
+		// destructive collection. A collector that asked for a lease and did not
+		// get one would delete its only copy on the strength of a 200.
+		settle(0, 0, OutcomeRefused)
+		refuse(w, Grant{Reason: ReasonBadLease, Detail: err.Error()})
+		return
+	}
+
+	if held > 0 {
+		s.getLeased(w, r, collection{
+			ctx: ctx, req: req, grant: g, settle: settle,
+			estate: estate, station: station, dir: dir, limit: limit,
+		}, held)
+		return
+	}
 
 	msgs, err := s.store.Take(estate, station, dir, limit)
 	if err != nil {
@@ -483,9 +512,10 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(msgs) == 0 && r.URL.Query().Get("wait") != "0" {
-		// Long-poll. An idle station costs one held connection rather than a
-		// request every few seconds, which is what makes a poll interval of
-		// "immediately" affordable on a link somebody is paying for.
+		// Long-poll. The line is held rather than answered empty, which is what
+		// makes a poll interval of "immediately" affordable on a link somebody is
+		// paying for. The bash station does not use it and fetches ?wait=0 on an
+		// interval; the README says so rather than claiming otherwise.
 		//
 		// The poll also watches for its own authority being withdrawn, because
 		// "authorise every call" says nothing about a call that is still in
@@ -517,6 +547,150 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		msgs = []Message{}
 	}
 	_ = json.NewEncoder(w).Encode(msgs)
+}
+
+// collection is what both collection paths share once admission has answered.
+//
+// Passed as one value rather than eight parameters because the leased path needs
+// every one of them: the authoriser's context and request to watch for
+// revocation, the grant's reference to settle against, and the settle function
+// itself so that a leased delivery is accounted exactly like an unleased one.
+type collection struct {
+	ctx     authCtx
+	req     Request
+	grant   Grant
+	settle  func(bytes int64, messages int, outcome Outcome)
+	estate  string
+	station string
+	dir     string
+	limit   int
+}
+
+// getLeased collects under a lease: the messages are marked and held rather than
+// deleted, and the collector is handed something to acknowledge with.
+func (s *Server) getLeased(w http.ResponseWriter, r *http.Request, c collection, held time.Duration) {
+	lease, err := s.store.TakeLeased(c.estate, c.station, c.dir, c.limit, held)
+	switch {
+	case errors.Is(err, ErrBadLease), errors.Is(err, ErrLeaseTooLong):
+		c.settle(0, 0, OutcomeRefused)
+		refuse(w, Grant{Reason: ReasonBadLease, Detail: err.Error()})
+		return
+	case errors.Is(err, ErrBadRoute):
+		c.settle(0, 0, OutcomeRefused)
+		refuse(w, Grant{Reason: ReasonBadRoute, Detail: err.Error()})
+		return
+	case err != nil:
+		c.settle(0, 0, OutcomeRefused)
+		s.log.Error("lease failed", "estate", c.estate, "station", c.station,
+			"dir", c.dir, "err", err)
+		refuse(w, Grant{Reason: ReasonInternal})
+		return
+	}
+	if len(lease.Messages) == 0 && r.URL.Query().Get("wait") != "0" {
+		// The same held line, and the same watch on it. A leased poll is held for
+		// as long as an unleased one, so the authority behind it can end the same
+		// way, and a collector must not be handed a lease its credential no longer
+		// covers.
+		woken, revoked := s.hold(r, key(c.estate, c.station, c.dir),
+			s.auth.Watch(c.ctx, c.req, c.grant.Ref))
+		switch {
+		case revoked != ReasonAllowed:
+			c.settle(0, 0, OutcomeRevoked)
+			s.refused(Grant{Reason: revoked}, c.estate, c.station, c.dir, OpRead)
+			refuse(w, Grant{Reason: revoked})
+			return
+		case woken:
+			lease, _ = s.store.TakeLeased(c.estate, c.station, c.dir, c.limit, held)
+		}
+	}
+	if lease.Messages == nil {
+		lease.Messages = []Message{}
+	}
+	delivered := int64(0)
+	for _, m := range lease.Messages {
+		delivered += int64(len(m.Body))
+	}
+	// Accounted as a delivery, because that is what it is: the bytes have left
+	// the relay. The acknowledgement that follows settles a count and no bytes,
+	// so a collector is not charged twice for being careful.
+	if len(lease.Messages) == 0 {
+		c.settle(0, 0, OutcomeEmpty)
+	} else {
+		c.settle(delivered, len(lease.Messages), OutcomeDelivered)
+	}
+	// Metadata only, as everywhere else here: how many, never what.
+	if lease.ID != "" {
+		s.log.Info("leased", "estate", c.estate, "station", c.station, "dir", c.dir,
+			"messages", len(lease.Messages), "lease", lease.ID)
+	}
+	writeJSON(w, lease)
+}
+
+// ack deletes what a collector has confirmed it holds.
+//
+// The READ scope, not the write scope: acknowledging is the second half of
+// collecting, and the side that may collect a queue is the side that may say it
+// has the messages. A station still cannot queue a request, which is checked in
+// TestAcknowledgingNeedsTheSameScopeAsCollecting rather than left to this comment.
+func (s *Server) ack(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	estate, station, dir := r.PathValue("estate"), r.PathValue("station"), r.PathValue("dir")
+	if !validDir(dir) {
+		refuse(w, Grant{Reason: ReasonBadRoute})
+		return
+	}
+	ctx := authCtx{r.Context()}
+	req := Request{
+		Credential: token(r), Estate: estate, Station: station, Dir: dir,
+		Op: OpRead, At: started,
+	}
+	g := s.auth.Admit(ctx, req)
+	if !g.Allow {
+		s.refused(g, estate, station, dir, OpRead)
+		refuse(w, g)
+		return
+	}
+	settle := func(messages int, outcome Outcome) {
+		s.auth.Settle(ctx, Settlement{
+			Ref: g.Ref, Estate: estate, Station: station, Dir: dir, Op: OpRead,
+			Messages: messages, Outcome: outcome, At: time.Now(), Started: started,
+		})
+	}
+
+	var in struct {
+		Lease string `json:"lease"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&in); err != nil {
+		settle(0, OutcomeRefused)
+		refuse(w, Grant{Reason: ReasonUnreadable, Detail: "could not read the acknowledgement"})
+		return
+	}
+	n, err := s.store.Ack(estate, station, dir, in.Lease)
+	switch {
+	case errors.Is(err, ErrNoSuchLease):
+		// 410 rather than 404: the route exists and the lease is what is gone.
+		// It expired, or this is a repeat of an acknowledgement that already
+		// worked, and a collector's safe response is the same either way - expect
+		// the messages again and recognise them by their ids.
+		settle(0, OutcomeRefused)
+		refuse(w, Grant{Reason: ReasonNoSuchLease})
+		return
+	case errors.Is(err, ErrBadRoute):
+		settle(0, OutcomeRefused)
+		refuse(w, Grant{Reason: ReasonBadRoute, Detail: err.Error()})
+		return
+	case err != nil:
+		settle(0, OutcomeRefused)
+		s.log.Error("ack failed", "estate", estate, "station", station, "dir", dir, "err", err)
+		refuse(w, Grant{Reason: ReasonInternal})
+		return
+	}
+	// A count and no bytes. The bytes were settled when they were handed over,
+	// and charging them again here would charge a collector for acknowledging.
+	settle(n, OutcomeAcknowledged)
+	s.log.Info("acked", "estate", estate, "station", station, "dir", dir,
+		"messages", n, "lease", in.Lease)
+	writeJSON(w, map[string]int{"deleted": n})
 }
 
 // hold waits for a message, the timeout, the client going away, or the
