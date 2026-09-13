@@ -1,6 +1,8 @@
 package relay_test
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -34,17 +36,19 @@ func estates() *relay.StaticAuth {
 // same suite against `wrangler dev` in CI, so the two implementations cannot
 // drift without one of them going red.
 func TestGoServerPassesTheContract(t *testing.T) {
-	// Wrapped so that a lease is recognised and refused for being unverifiable
-	// rather than reported as a bad credential. Every relay does this; only the
-	// verifier differs, and there is none here.
+	// Wrapped so leases are read and verified against the contract's published
+	// key. The suite signs with the matching seed; this relay holds only the
+	// public half and provably cannot produce a signature of its own.
 	srv := httptest.NewServer(relay.NewAuthorisingServer(relay.NewStore(),
-		&relay.AuthorityAuth{Inner: relay.FromAuth(estates())}, quietLog()).Routes())
+		&relay.AuthorityAuth{Inner: relay.FromAuth(estates()), Verify: contractVerifier(t)},
+		quietLog()).Routes())
 	t.Cleanup(srv.Close)
 
 	rs := conformance.Run(conformance.Target{
 		BaseURL: srv.URL, Estate: "e1", Station: "st1",
 		Control: "ctl", StationTok: "stn",
 		OtherEstate: "e2", OtherControl: "other-ctl",
+		SignLease: contractSigner(t),
 	})
 	if !conformance.Report(os.Stdout, "go server", rs) {
 		t.Fatal("the Go server does not satisfy the relay contract")
@@ -69,7 +73,7 @@ func TestTheGoServerPassesTheContractBehindARemoteAuthoriser(t *testing.T) {
 	// refuses estate-wide credentials, and because that is the configuration
 	// the hosted service actually runs.
 	srv := httptest.NewServer(relay.NewAuthorisingServer(relay.NewStore(),
-		&relay.AuthorityAuth{Inner: relay.Hosted{Inner: auth}},
+		&relay.AuthorityAuth{Inner: relay.Hosted{Inner: auth}, Verify: contractVerifier(t)},
 		slog.New(slog.NewTextHandler(io.Discard, nil))).Routes())
 	t.Cleanup(srv.Close)
 
@@ -80,6 +84,7 @@ func TestTheGoServerPassesTheContractBehindARemoteAuthoriser(t *testing.T) {
 		ControlPlane:  cp.lever,
 		AuthoriserSaw: cp.saw,
 		Tenancy:       true,
+		SignLease:     contractSigner(t),
 	})
 	if !conformance.Report(os.Stdout, "go server behind a remote authoriser", rs) {
 		t.Fatal("the Go server behind RemoteAuth does not satisfy the relay contract")
@@ -122,11 +127,11 @@ func TestGoServerPassesTheContractWhenDurable(t *testing.T) {
 		if _, err := store.OpenSpool(dir); err != nil {
 			t.Fatalf("OpenSpool(%q): %v", dir, err)
 		}
-		// The same wrapper the other passes use: a lease is recognised and
-		// refused for being unverifiable rather than reported as a bad
-		// credential. Durability does not change that and must not skip it.
+		// The same wrapper the other passes use, verifier included. Durability
+		// does not change how a lease is read and must not skip it.
 		front.swap(relay.NewAuthorisingServer(store,
-			&relay.AuthorityAuth{Inner: relay.FromAuth(estates())}, quietLog()).Routes())
+			&relay.AuthorityAuth{Inner: relay.FromAuth(estates()), Verify: contractVerifier(t)},
+			quietLog()).Routes())
 	}
 	open()
 	srv := httptest.NewServer(front)
@@ -136,6 +141,7 @@ func TestGoServerPassesTheContractWhenDurable(t *testing.T) {
 		BaseURL: srv.URL, Estate: "e1", Station: "st1",
 		Control: "ctl", StationTok: "stn",
 		OtherEstate: "e2", OtherControl: "other-ctl",
+		SignLease: contractSigner(t),
 		Disrupt: func() error {
 			open()
 			return nil
@@ -347,4 +353,29 @@ func stationScope(estate, station string, read, write []string) map[string]any {
 		"estate": estate, "stations": []string{station}, "allStations": false,
 		"read": read, "write": write,
 	}
+}
+
+// The contract's keypair: the relay under test verifies with the public half,
+// and the suite signs with the private one.
+//
+// The relay never holds the seed. TestTheRelayBinaryCannotSignALease reads the
+// built binary's symbol table and fails if any route to an ed25519 private key
+// is linked into it, so this split is enforced rather than described.
+func contractVerifier(t *testing.T) relay.AuthorityVerifier {
+	t.Helper()
+	pub, err := relay.ParseEd25519PublicKey(conformance.LeaseKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return relay.Ed25519Verifier(pub)
+}
+
+func contractSigner(t *testing.T) func(payload string) []byte {
+	t.Helper()
+	seed, err := hex.DecodeString(conformance.LeaseSeed)
+	if err != nil || len(seed) != ed25519.SeedSize {
+		t.Fatalf("the contract seed is not a %d-byte hex seed: %v", ed25519.SeedSize, err)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	return func(payload string) []byte { return ed25519.Sign(priv, []byte(payload)) }
 }

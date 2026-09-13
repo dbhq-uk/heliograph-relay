@@ -21,15 +21,31 @@ host, no storage account, no VNet and no inbound firewall rule.
 
 ## What it can and cannot do
 
-**There is no cryptography in this repository.** That is the design, not an
-omission. Every message arrives already sealed by the client and bound to its
-estate, station, direction and sequence number, and signed. This server sees a
-byte slice, a routing key and a length.
+**There is no key here worth stealing and no plaintext to subpoena.** That is
+the design, not an omission. Every message arrives already sealed by the client
+and bound to its estate, station, direction and sequence number, and signed.
+This server sees a byte slice, a routing key and a length.
 
-That is what makes the claim checkable: there is no key here to leak, no
+> **This section used to say "There is no cryptography in this repository."**
+> It is corrected here rather than quietly edited, because it was offered as a
+> reason to trust this component and somebody may have approved the relay on the
+> strength of it.
+>
+> That sentence was a **proxy** for the claim above, and the proxy has narrowed
+> while the claim has not. The relay now verifies authorisation lease signatures
+> with Ed25519, in both implementations, and **a public key is not a secret**:
+> an attacker who takes everything this relay holds gets a key that checks
+> signatures and makes none. Nothing else changed. It still holds no private
+> key, still never sees plaintext, and still cannot forge a message.
+>
+> What it cost: a reader can no longer confirm the old sentence with one grep.
+> So the narrower rule is enforced instead of asserted, and by the linker rather
+> than by a grep - see [Verified, never signed](#verified-never-signed).
+
+That is what makes the claim checkable: there is no private key here to leak, no
 plaintext to subpoena, and no code path that could be persuaded to produce
-either. You can establish it by reading `relay.go` and `server.go` rather than
-by trusting whoever is running it.
+either. You can establish it by reading `relay.go`, `server.go` and `verify.go`
+rather than by trusting whoever is running it.
 
 **It can:**
 
@@ -127,6 +143,7 @@ certificates would be a bigger thing to audit for no gain.
 | `HELIOGRAPH_RELAY_STATIONS` | `estate:station:role:credential`, comma separated. `role` is `control` or `station`. Per-station scope |
 | `HELIOGRAPH_RELAY_AUTHORISER` | a URL that answers authorisation decisions. When set, estates are that service's business and `HELIOGRAPH_RELAY_ESTATES` is not read |
 | `HELIOGRAPH_RELAY_HOSTED` | refuse any credential not scoped to named stations, including one that declines to say |
+| `HELIOGRAPH_RELAY_LEASE_KEY` | the Ed25519 **public** key authorisation leases are signed with, hex or base64. Unset means every lease is refused |
 | `HELIOGRAPH_RELAY_SPOOL` | directory for durable messages. Unset means a restart drops what has not been collected: see [Storage](#storage) |
 
 It **refuses to start** with none of the three configured. Starting and answering 401
@@ -264,6 +281,14 @@ and the thing that is not readable never touches it.**
 
 ## Authorisation leases
 
+**Two different things in this repository share the word "lease" and nothing
+else.** A *collection* lease is a collector holding messages between reading
+them and confirming it has them, so a collector that dies loses nothing
+(`lease.go`, `?lease=` and `/ack`). An **authorisation** lease, which this
+section is about, is who may collect at all (`authlease.go`). Neither implies
+the other: a station can hold an authorisation lease and never ask for a
+collection lease, and the reverse.
+
 An authoriser in front of every operation, failing closed, turns **our** outage
 into the customer's transport outage. Cached decisions expire, a newly started
 relay has no cache at all, and the fleet loses access. On a transport whose
@@ -308,23 +333,38 @@ here. Revocation stops the next collection and ends an open poll. A command the
 station has already taken is the station's replay and request-id handling, not
 this server's. `TestRevocationDoesNotRecallAMessageAlreadyDelivered` says so.
 
-### Neither implementation can verify a lease signature, and that is stated rather than implied
+### Verified, never signed
+
+A lease is signed with **Ed25519** and both implementations verify it. **Neither
+can produce one**, and that is enforced rather than promised.
+
+```bash
+HELIOGRAPH_RELAY_LEASE_KEY=<32-byte Ed25519 public key, hex or base64>
+```
+
+The relay holds the **public** half and nothing else. Unset means every lease is
+refused, which is the only safe default: a relay that accepted an unverified
+lease would accept a forged one, and the forger chooses the scope. A 64-byte
+value is refused by name rather than truncated to its public half, because that
+is an Ed25519 private key and accepting it would leave signing material in the
+configuration of a component whose whole claim is that it holds none.
+
+**How "cannot sign" is established.** Not by reading the source, and not by a
+grep: both can be satisfied by code that imports a package and calls it
+somewhere else.
 
 | | |
 |---|---|
-| **Go binary** | reads and validates every part of a lease, and refuses it as `authority-unverifiable` until an operator supplies an `AuthorityVerifier` |
-| **Worker** | recognises a lease and refuses it as `authority-unverifiable`. There is no seam to fill |
+| **Go binary** | CI builds `cmd/heliograph-relay` and reads its **symbol table**. Go links only reachable code, so a binary with no route to constructing an `ed25519` private key has no code path that could sign anything. `TestTheRelayBinaryCannotSignALease` |
+| **Worker** | a bundle has no symbol table, so CI allowlists the two calls that verify - `crypto.subtle.importKey` and `crypto.subtle.verify` - and fails on `sign`, `generateKey`, `deriveKey`, `exportKey` and the rest. The key is imported with `extractable: false` and `["verify"]` as its only usage, so the runtime itself refuses to sign with it or hand it back |
 
-There is **no cryptography in this repository**, and verifying a signature is
-cryptography. Ed25519 is the right primitive and is forbidden here; HMAC-SHA256
-could be built from `crypto/sha256` alone, and is refused twice over, because a
-relay able to verify a symmetric MAC is a relay able to **mint** any lease it
-likes, and because hand-rolling a primitive to get past the CI grep evades that
-rule rather than satisfying it.
+The check is known to discriminate rather than merely pass:
+`TestTheSigningCheckCanTellASignerFromAVerifier` builds the conformance harness,
+which **does** sign, and fails if the check cannot see the difference.
 
-So the format, every local check and the seam are published, and the primitive
-is not chosen here. **A relay with no verifier refuses every lease**, which is
-the only safe default, and both implementations do it identically.
+**HMAC was rejected**, though it would have needed no new primitive at all. It
+is symmetric, so a relay able to verify is a relay able to **mint** any lease it
+likes. That ends the claim rather than narrowing a sentence about it.
 
 ### Why this rather than a fork
 
@@ -350,7 +390,7 @@ Beside the sentence, in a field a program can read.
 | `queue-full` | 429 | the recipient has stopped collecting |
 | `out-of-scope` | 401 | a credential this relay knows, used somewhere it does not reach |
 | `authority-expired` | 401 | an authorisation lease outside the window it was minted for |
-| `authority-unverifiable` | 401 | an authorisation lease whose signature nothing here can check |
+| `authority-unverifiable` | 401 | an authorisation lease whose signature does not check against the configured key |
 | `estate-wide-credential` | 401 | a credential too wide for a tenant that may hold several customers |
 
 The sentence is for a person and the reason is for a program, because a client

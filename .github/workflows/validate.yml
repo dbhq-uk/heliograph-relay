@@ -41,6 +41,10 @@ jobs:
           export HELIOGRAPH_RELAY_SPOOL=/tmp/spool
           export HELIOGRAPH_RELAY_ADDR=:8097
           export HELIOGRAPH_RELAY_ESTATES="e1:ctl:stn,e2:other-ctl:other-stn"
+          # The contract's published lease key. A test fixture, not a secret:
+          # the matching seed is in conformance/ so the suite can mint leases
+          # this relay will accept. The relay holds only the public half.
+          export HELIOGRAPH_RELAY_LEASE_KEY="79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"
           ./scripts/restart-go-relay.sh
           for i in $(seq 1 30); do
             curl -sf http://localhost:8097/health >/dev/null && break
@@ -65,21 +69,72 @@ jobs:
           fi
           echo "no dependencies"
 
-      - name: no cryptography in this repository
-        # The security claim is that there is no key here to leak and no
-        # plaintext to subpoena. sha256 for token comparison is the sole
-        # exception, and it never touches a message body.
+      - name: no cryptography beyond hashing and verification
+        # The claim is that there is no key HERE WORTH STEALING and no plaintext
+        # to subpoena. Three imports serve it and nothing else is permitted:
+        #
+        #   crypto/sha256   token and credential digests, never a message body
+        #   crypto/subtle   constant-time comparison
+        #   crypto/ed25519  VERIFYING authorisation lease signatures
+        #
+        # ed25519 was added deliberately and narrowly
+        # (heliograph-io/heliograph-cloud#75). A public key is not a secret, so
+        # the claim is untouched; the sentence that used to stand in for it,
+        # "no cryptography in this repository", is what narrowed, and README.md,
+        # SECURITY.md and relay.go each say so where they said the old thing.
+        #
+        # THIS STEP IS NOT WHAT KEEPS IT NARROW. An import list cannot tell
+        # verifying from signing. The step below can.
+        #
+        # `go list` rather than grep, because grep cannot tell an import from a
+        # string that looks like one. The check below names ed25519 symbols in
+        # string literals, and a grep-based rule reported those as cryptographic
+        # imports: a false alarm that would have been silenced by loosening the
+        # rule, which is the worst possible outcome for a rule like this one.
         run: |
           set -euo pipefail
           bad=0
-          while read -r hit; do
-            case "$hit" in
-              *crypto/sha256*|*crypto/subtle*) ;;
-              *) echo "::error::cryptographic import in the relay: $hit"; bad=1 ;;
+          while read -r imp; do
+            case "$imp" in
+              crypto/sha256|crypto/subtle|crypto/ed25519) ;;
+              crypto/*) echo "::error::cryptographic import in the relay: $imp"; bad=1 ;;
             esac
-          done < <(grep -rn '"crypto/' --include='*.go' . || true)
+          done < <(go list -f '{{join .Imports "\n"}}{{"\n"}}{{join .TestImports "\n"}}{{"\n"}}{{join .XTestImports "\n"}}' ./... | sort -u)
           [ "$bad" = "0" ] || exit 1
-          echo "no cryptography beyond constant-time token comparison"
+          echo "no cryptography beyond sha256, subtle and ed25519 verification"
+
+      - name: the relay binary cannot sign a lease
+        # THE STEP THAT CARRIES THE DECISION, and it is by construction rather
+        # than by grep. Go links only reachable code, so a binary with no route
+        # to CONSTRUCTING an ed25519 private key has no code path that could
+        # sign anything - whatever any source file appears to import.
+        #
+        # A relay that could mint its own leases would be a relay that could
+        # authorise itself for any estate, which is exactly the claim this whole
+        # component rests on. The same assertion runs in `go test` as
+        # TestTheRelayBinaryCannotSignALease; it is repeated here so a reviewer
+        # reading CI sees the rule beside the others rather than having to know
+        # a test name.
+        run: |
+          set -euo pipefail
+          go build -o /tmp/relay-signcheck ./cmd/heliograph-relay
+          # Written to a file rather than piped. `go tool nm | grep -q` makes nm
+          # die of a broken pipe when grep exits early, and under pipefail that
+          # fails the step for a reason that has nothing to do with the rule.
+          go tool nm /tmp/relay-signcheck | awk '{print $NF}' > /tmp/relay-syms.txt
+          found="$(grep -E '^crypto/ed25519\.(GenerateKey|sign|newKeyFromSeed)|^crypto/internal/fips140/ed25519\.(generateKey|newPrivateKey|newPrivateKeyFromSeed)' /tmp/relay-syms.txt || true)"
+          if [ -n "$found" ]; then
+            echo "::error::the relay binary links a route to an ed25519 private key, so it can mint leases:"
+            echo "$found"
+            exit 1
+          fi
+          # And it does verify, or the check above is satisfied by a binary that
+          # simply does not do Ed25519 at all and proves nothing.
+          if ! grep -q '^crypto/internal/fips140/ed25519.verify$' /tmp/relay-syms.txt; then
+            echo "::error::the relay binary links no ed25519 verification, so the absence of signing proves nothing"
+            exit 1
+          fi
+          echo "the relay verifies lease signatures and cannot produce one"
 
       - name: the image builds
         run: docker build -t heliograph-relay:test .
@@ -212,6 +267,7 @@ jobs:
           npx wrangler dev --port 8788 --inspector-port 9230 --local \
             --var HELIOGRAPH_RELAY_AUTHORISER:"http://127.0.0.1:9797/decide" \
             --var HELIOGRAPH_RELAY_HOSTED:"1" \
+            --var HELIOGRAPH_RELAY_LEASE_KEY:"79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664" \
             > /tmp/wrangler-authz.log 2>&1 &
           for i in $(seq 1 60); do
             curl -sf http://localhost:8788/health >/dev/null && break
@@ -235,10 +291,30 @@ jobs:
           HELIOGRAPH_CONF_TENANCY: "1"
         run: go run ./cmd/conformance http://localhost:8788 "cloudflare worker, hosted tenant behind a remote authoriser"
 
-      - name: no cryptography in the worker either
+      - name: verification only at the edge
+        # The same narrowing as the Go server, on the same terms
+        # (heliograph-io/heliograph-cloud#75). The edge was included
+        # deliberately: this is the relay almost every customer touches, and a
+        # lease that could not be honoured here would leave the control-plane
+        # outage protection absent from the only relay most people use.
+        #
+        # A bundle has no symbol table, so the rule is enforced on the source by
+        # allowlisting the two calls that verify and forbidding every call that
+        # could sign, generate or extract a key. importKey is additionally given
+        # extractable:false and ["verify"] as its only usage, so the runtime
+        # refuses to sign with the key or hand it back whatever this code asks.
         run: |
-          if grep -rnE "crypto[.]|subtle[.]|WebCrypto|createHash" edge/src/*.ts; then
-            echo "::error::cryptography in the edge relay. It stores ciphertext; it does not touch it."
+          set -euo pipefail
+          if grep -rnE "subtle\.(sign|generateKey|deriveKey|deriveBits|exportKey|wrapKey|unwrapKey|encrypt|decrypt|digest)|createHash|WebCrypto" edge/src/*.ts; then
+            echo "::error::the edge relay may verify a signature and nothing else. Signing, key generation and key extraction are forbidden."
             exit 1
           fi
-          echo "no cryptography at the edge"
+          bad=0
+          while read -r hit; do
+            case "$hit" in
+              *"crypto.subtle.importKey"*|*"crypto.subtle.verify"*) ;;
+              *) echo "::error::cryptography at the edge beyond importKey and verify: $hit"; bad=1 ;;
+            esac
+          done < <(grep -rnE "crypto[.]|subtle[.]" edge/src/*.ts || true)
+          [ "$bad" = "0" ] || exit 1
+          echo "the worker verifies lease signatures and cannot produce one"

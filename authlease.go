@@ -31,9 +31,11 @@ import (
 // harder availability dependency, longer means the reverse. So the decision is
 // which number to publish, and MaxAuthorityLife is it.
 //
-// NOT LEASED COLLECTION. lease.go is a different thing with a similar name: a
-// collector holding messages between reading them and confirming it has them.
-// This file is about who may collect at all.
+// NOT LEASED COLLECTION, and the two share a word and nothing else. lease.go is
+// a collector holding messages between reading them and confirming it has them,
+// so a collector that dies loses nothing. This file is about who may collect at
+// all. Neither implies the other: a station can hold an authorisation lease and
+// never ask for a collection lease, and the reverse.
 //
 // heliograph-io/heliograph-cloud#75.
 
@@ -178,27 +180,16 @@ type signed struct {
 // AuthorityVerifier checks that a lease was minted by somebody entitled to mint
 // it.
 //
-// THERE IS NO IMPLEMENTATION OF THIS IN THIS REPOSITORY, AND THAT IS A KNOWN
-// GAP RATHER THAN AN OVERSIGHT.
+// Ed25519Verifier in verify.go is the implementation, and it VERIFIES ONLY.
+// There is no signing anywhere in the shipped relay, and that is established by
+// the linker rather than by this comment: TestTheRelayBinaryCannotSignALease
+// reads the built binary's symbol table and fails if any route to constructing
+// an ed25519 private key is reachable from main.
 //
-// `.github/workflows/validate.yml` permits crypto/sha256 and crypto/subtle and
-// nothing else, and forbids cryptography at the edge entirely. Verifying a
-// signature needs a primitive that rule excludes:
-//
-//   - Ed25519 is the right answer. The relay would hold only a public key and
-//     could not mint a lease even if it were compromised. It needs
-//     crypto/ed25519, which the rule forbids.
-//   - HMAC-SHA256 could be built from crypto/sha256 alone and would pass the
-//     rule as written. It is refused here twice over: it is symmetric, so a
-//     relay able to verify is a relay able to MINT any lease it likes, which
-//     gives up "the relay holds no keys"; and hand-rolling a primitive to get
-//     past a grep evades the rule rather than satisfying it, which
-//     CONTRIBUTING.md says plainly.
-//
-// So the seam is published and the primitive is not chosen here. A deployment
-// supplies a verifier; a deployment that supplies none refuses every lease,
-// which is the only safe default. The options and their costs are written up on
-// heliograph-io/heliograph-cloud#75 rather than settled by relaxing the rule.
+// The seam stays an interface rather than becoming a concrete type, because an
+// operator with their own control plane may sign leases some other way, and
+// because it is what lets a test drive the lease machinery without a primitive.
+// heliograph-io/heliograph-cloud#75 has the decision and the options it beat.
 type AuthorityVerifier interface {
 	// Verify reports whether signature is a valid signature over payload.
 	//
