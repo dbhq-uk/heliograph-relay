@@ -34,7 +34,8 @@ const (
 // Bytes is a size, not a sample.
 type Request struct {
 	// Credential is the bearer token as presented. An authoriser that sends it
-	// anywhere is making that choice itself: RemoteAuth sends a sha256 of it.
+	// anywhere is making that choice itself, and RemoteAuth says why it sends
+	// it as it stands.
 	Credential string
 	Estate     string
 	Station    string
@@ -68,6 +69,12 @@ const (
 	// About us, not about the caller. These answer 503, and that difference is
 	// the whole point of the type.
 	ReasonAuthoriserUnavailable Reason = "authoriser-unavailable"
+
+	// ReasonRevoked is authority withdrawn while something was still open. It
+	// answers 401 because it IS about the credential, and it is separate from
+	// bad-credential because the credential was good when the poll started and
+	// a client that retries with it will be told so.
+	ReasonRevoked Reason = "authority-revoked"
 
 	// About the request or the queue.
 	ReasonBadRoute   Reason = "bad-route"
@@ -110,6 +117,8 @@ func (r Reason) Detail() string {
 	switch r {
 	case ReasonWrongDirection:
 		return "not authorised to write that direction for this estate"
+	case ReasonRevoked:
+		return "the authority for this request was withdrawn while it was open"
 	case ReasonAuthoriserUnavailable:
 		return "the authoriser could not be reached, so this request was neither allowed nor refused"
 	case ReasonBadRoute:
@@ -138,28 +147,150 @@ type Grant struct {
 	// Detail, when set, is what the client is told. Safe to return: an
 	// authoriser that puts something sensitive here has published it.
 	Detail string
+
+	// MaxBytes caps this one operation, below the server's own limit. Zero
+	// means the server's limit, which is MaxBodyBytes.
+	//
+	// Without this the only lever an operator has over a client posting 8 MiB
+	// per message is refusing the account. A per-operation cap is one of the
+	// four things a boolean AllowWrite could not express.
+	MaxBytes int64
+
+	// Ref identifies whatever the authoriser reserved, and comes back on the
+	// Settlement. Opaque here: the relay copies it and never reads it.
+	//
+	// It exists because admission and accounting are separated in time. Quota
+	// has to be reserved before the bytes move and charged after, or two
+	// concurrent writes each see room for one and both take it.
+	Ref string
 }
 
-// Authoriser is the seam the hosted service lives behind.
+// Admission decides whether an attempt may proceed, and reserves what it will
+// consume.
 //
-// One method here, deliberately, because heliograph-io/heliograph-cloud#68
-// widens it to admission, accounting and session lifecycle and that is a
-// different change with a different argument. What is settled now is the shape
-// of the answer: a reason rather than a boolean.
-type Authoriser interface {
-	// Admit is called before a body is read on a write, and before a queue is
-	// touched on a read.
+// Called before a body is read on a write and before a queue is touched on a
+// read, so a refusal costs nothing and a reservation is taken before the thing
+// it is reserving for happens.
+type Admission interface {
 	Admit(ctx context.Context, req Request) Grant
 }
+
+// Accounting is told what actually happened, after it happened.
+//
+// Separate from Admission because the two see different numbers. Admission sees
+// a declared size, which is what the client said before anything was read;
+// charging on that is charging on a number the payer chose. Accounting sees
+// what moved.
+//
+// Settle must not block. It is called on the request path, and an authoriser
+// that wants to write a row somewhere should queue it and return.
+type Accounting interface {
+	Settle(ctx context.Context, s Settlement)
+}
+
+// Sessions is the lifecycle of authority that outlives the decision granting
+// it.
+//
+// A long poll is held for 25 seconds by design, and "authorise every call" says
+// nothing about a call that is still in progress. Without this, revoking a
+// credential means revoked at some point in the next half minute, and the
+// person doing the revoking has no way to know when.
+type Sessions interface {
+	// Watch reports that the authority behind req has ended before its grant
+	// would have expired. The relay selects on the returned channel for as long
+	// as it is holding something open, and ends it with the Reason received.
+	//
+	// A nil channel is the correct answer for an authoriser with no revocation
+	// to report: it blocks for ever, so nothing is ever revoked mid-flight and
+	// nothing is ever woken by accident.
+	//
+	// ref is the Grant's Ref, so an authoriser can match the watch to whatever
+	// it reserved.
+	Watch(ctx context.Context, req Request, ref string) <-chan Reason
+}
+
+// Authoriser is the whole seam: admission, accounting and session lifecycle.
+//
+// Three interfaces rather than three loose methods, because they are three
+// concerns and an implementation may genuinely care about one. They are
+// composed here because the server needs all three, and because the alternative
+// is asking whether an authoriser happens to implement Accounting and silently
+// skipping it when it does not. A rule that only applies to some implementers
+// is not a rule: that mistake is already recorded above the Auth interface, and
+// it is not being made twice.
+//
+// NoAccounting and NoSessions are embeddable for anybody who wants only the
+// gate.
+//
+// heliograph-io/heliograph-cloud#68.
+type Authoriser interface {
+	Admission
+	Accounting
+	Sessions
+}
+
+// Outcome is what became of an operation.
+type Outcome string
+
+const (
+	// OutcomeAccepted is a write that was queued.
+	OutcomeAccepted Outcome = "accepted"
+	// OutcomeDelivered is a read that handed messages over.
+	OutcomeDelivered Outcome = "delivered"
+	// OutcomeEmpty is a read that found nothing. Accounted anyway: an idle
+	// station polls for ever, and a held connection that nobody meters is a
+	// cost whose first appearance is the bill.
+	OutcomeEmpty Outcome = "empty"
+	// OutcomeRefused is an operation the store would not take.
+	OutcomeRefused Outcome = "refused"
+	// OutcomeRevoked is something ended mid-flight by Sessions.Watch.
+	OutcomeRevoked Outcome = "revoked"
+)
+
+// Settlement is what an operation actually cost.
+//
+// The same rule as Request, and for the same reason: routing, counts and an
+// outcome. Bytes is a total, not a sample, and there is no field here anybody
+// could follow to content.
+type Settlement struct {
+	// Ref is the Grant's Ref, unchanged.
+	Ref      string
+	Estate   string
+	Station  string
+	Dir      string
+	Op       Op
+	Bytes    int64
+	Messages int
+	Outcome  Outcome
+	At       time.Time
+	Started  time.Time
+}
+
+// NoAccounting is embeddable by an authoriser with nothing to meter.
+type NoAccounting struct{}
+
+// Settle does nothing, which is the honest behaviour for a self-hosted relay
+// where there is no bill.
+func (NoAccounting) Settle(context.Context, Settlement) {}
+
+// NoSessions is embeddable by an authoriser that never revokes mid-flight.
+type NoSessions struct{}
+
+// Watch returns nil, which blocks for ever. See Sessions.Watch.
+func (NoSessions) Watch(context.Context, Request, string) <-chan Reason { return nil }
 
 // FromAuth lifts a boolean Auth onto the Authoriser seam.
 //
 // StaticAuth and anything else a self-hoster wrote keeps working unchanged, and
 // gets the distinguishable refusals for free, because the adapter can tell the
 // three cases apart by asking twice.
-func FromAuth(a Auth) Authoriser { return authAdapter{a} }
+func FromAuth(a Auth) Authoriser { return authAdapter{auth: a} }
 
-type authAdapter struct{ auth Auth }
+type authAdapter struct {
+	NoAccounting
+	NoSessions
+	auth Auth
+}
 
 func (ad authAdapter) Admit(_ context.Context, req Request) Grant {
 	if req.Credential == "" {

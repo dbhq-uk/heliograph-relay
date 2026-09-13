@@ -40,6 +40,8 @@ package conformance
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,6 +74,16 @@ type Target struct {
 	// pulled. Leaving it nil skips the section and says so, rather than
 	// reporting a pass nobody earned.
 	ControlPlane func() (restore func())
+
+	// AuthoriserSaw returns everything the harness's control plane has been
+	// sent since the run began, concatenated and unmodified.
+	//
+	// The strongest sentence this product has is that the thing which is not
+	// readable never touches your ciphertext. This is how that is checked
+	// against a running relay rather than against its source: put a
+	// recognisable pattern of bytes through, then look at every byte the
+	// authoriser was given and fail if the pattern is in there.
+	AuthoriserSaw func() []byte
 }
 
 // refusal is what a relay says when it says no.
@@ -355,6 +367,39 @@ func Run(t Target) []Result {
 			fmt.Sprintf("got %d %q", code, why.Reason))
 	} else {
 		ok("SKIPPED: the authoriser outage section needs a lever this harness did not supply",
+			true, "")
+	}
+
+	// --- the authoriser never sees a message body -------------------------
+	// heliograph-io/heliograph-cloud#68. The claim is that the thing which is
+	// not readable never touches ciphertext, and a rule saying an authoriser
+	// must not look is worth nothing. Put a recognisable pattern through and
+	// read back every byte the authoriser was handed.
+	if t.AuthoriserSaw != nil {
+		sentinel := []byte("SENTINEL-0xFEEDFACE-no-authoriser-may-see-this")
+		body := uniq + "-sentinel"
+		code, _ = t.put(t.Estate, body, "c2s", t.Control, 1, sentinel)
+		ok("the sentinel message was accepted", code == 202, fmt.Sprintf("got %d", code))
+		_, _, _ = t.take(t.Estate, body, "c2s", t.StationTok)
+
+		saw := t.AuthoriserSaw()
+		leaked := ""
+		for _, form := range []string{
+			string(sentinel),
+			base64.StdEncoding.EncodeToString(sentinel),
+			base64.URLEncoding.EncodeToString(sentinel),
+			hex.EncodeToString(sentinel),
+		} {
+			if bytes.Contains(saw, []byte(form)) {
+				leaked = form
+			}
+		}
+		ok("the authoriser is never sent a message body", leaked == "",
+			fmt.Sprintf("found %q in %d bytes the authoriser was sent", leaked, len(saw)))
+		ok("the authoriser was asked something, so the check above means anything",
+			len(saw) > 0, fmt.Sprintf("the authoriser was sent %d bytes", len(saw)))
+	} else {
+		ok("SKIPPED: the authoriser body check needs a control plane this harness did not supply",
 			true, "")
 	}
 
