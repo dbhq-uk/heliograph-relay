@@ -825,6 +825,40 @@ func (t Target) leasing(uniq string) []Result {
 			fmt.Sprintf("both %q", back.Lease))
 	}
 
+	// --- the long poll, under a lease ---------------------------------------
+	// The combination a real collector uses: wait for a message and hold it. Both
+	// halves are asserted separately above and in the poll section, and a relay
+	// that woke from the poll and then answered as though no lease had been asked
+	// for would pass both of those and still lose the message.
+	poll := uniq + "-leasepoll"
+	woke := make(chan leaseReply, 1)
+	go func() {
+		resp, b, err := t.do("GET", t.url(t.Estate, poll, "c2s", "lease=30s"), t.StationTok, nil)
+		if err != nil || resp.StatusCode != 200 {
+			woke <- leaseReply{}
+			return
+		}
+		var got leaseReply
+		_ = json.Unmarshal(b, &got)
+		woke <- got
+	}()
+	time.Sleep(400 * time.Millisecond)
+	_, _ = t.put(t.Estate, poll, "c2s", t.Control, 1, []byte("wake up"))
+	select {
+	case got := <-woke:
+		ok("a long poll that asked for a lease wakes holding one",
+			got.Lease != "" && len(got.Messages) == 1,
+			fmt.Sprintf("woke with lease=%q and %d messages", got.Lease, len(got.Messages)))
+		if got.Lease != "" {
+			// And it really is a lease: the message is still there to acknowledge.
+			code, deleted, _ := t.ack(t.Estate, poll, "c2s", t.StationTok, got.Lease)
+			ok("the lease from a long poll can be acknowledged", code == 200 && deleted == 1,
+				fmt.Sprintf("got %d, deleted %d", code, deleted))
+		}
+	case <-time.After(40 * time.Second):
+		ok("a long poll that asked for a lease wakes holding one", false, "it never returned")
+	}
+
 	// --- the lease parameter itself ------------------------------------------
 	// One grammar, implemented by both. A form that works against one relay and
 	// 400s against the other is the drift this suite exists to catch.
