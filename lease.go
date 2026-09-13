@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -58,6 +59,30 @@ type Lease struct {
 	ID       string    `json:"lease"`
 	Until    time.Time `json:"until"`
 	Messages []Message `json:"messages"`
+}
+
+// MarshalJSON writes an EMPTY until when there is no lease, rather than Go's
+// zero time.
+//
+// Without this the two implementations answer an empty leased collection
+// differently: "0001-01-01T00:00:00Z" here and "" in the Worker, which is drift
+// in a field a client reads. Found by driving both with curl rather than by a
+// test, so the contract now asserts it - see conformance/, "an empty leased
+// collection says so in both fields".
+func (l Lease) MarshalJSON() ([]byte, error) {
+	until := ""
+	if !l.Until.IsZero() {
+		until = l.Until.Format(time.RFC3339Nano)
+	}
+	msgs := l.Messages
+	if msgs == nil {
+		msgs = []Message{}
+	}
+	return json.Marshal(struct {
+		ID       string    `json:"lease"`
+		Until    string    `json:"until"`
+		Messages []Message `json:"messages"`
+	}{ID: l.ID, Until: until, Messages: msgs})
 }
 
 // ParseLease reads the ?lease= parameter.

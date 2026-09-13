@@ -770,6 +770,15 @@ func (t Target) leasing(uniq string) []Result {
 	_, second, _ := t.takeLeased(t.Estate, held, "c2s", t.StationTok, "30s")
 	ok("a message under a live lease is not handed to a second collector",
 		len(second.Messages) == 0, fmt.Sprintf("got %d", len(second.Messages)))
+	// And an empty leased collection says so in BOTH fields, identically on both
+	// implementations. The Go server marshalled its zero time here and the Worker
+	// sent an empty string, which is drift in a field a client reads: a collector
+	// that trusted `until` would have been handed year 1 by one relay and nothing
+	// by the other. Found by driving them with curl rather than by a test, which
+	// is why there is now a test.
+	ok("an empty leased collection says so in both fields",
+		second.Lease == "" && second.Until == "",
+		fmt.Sprintf("lease=%q until=%q", second.Lease, second.Until))
 	_, plainSteal, _ := t.take(t.Estate, held, "c2s", t.StationTok)
 	ok("a message under a live lease is not handed to a collection with no lease",
 		len(plainSteal) == 0, fmt.Sprintf("got %d", len(plainSteal)))

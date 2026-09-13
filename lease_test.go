@@ -21,8 +21,11 @@ import (
 // heliograph-io/heliograph-cloud#9.
 
 type leaseReply struct {
-	Lease    string    `json:"lease"`
-	Until    time.Time `json:"until"`
+	Lease string `json:"lease"`
+	// A string, not a time.Time, because an empty leased collection answers
+	// "until":"" - the same as the Worker, which is the point. Decoding into a
+	// time.Time would fail on the empty case and hide the agreement.
+	Until    string    `json:"until"`
 	Messages []Message `json:"messages"`
 }
 
@@ -103,8 +106,11 @@ func TestALeasedMessageIsHeldUntilItIsAcknowledged(t *testing.T) {
 	if held.Lease == "" {
 		t.Fatal("no lease id came back, so nothing can be acknowledged")
 	}
-	if held.Until.IsZero() {
+	if held.Until == "" {
 		t.Error("no deadline came back, so a collector cannot tell how long it has")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, held.Until); err != nil {
+		t.Errorf("the deadline is not a timestamp a client can parse: %q", held.Until)
 	}
 	// Still on the relay: this is the whole point. The collector has not said it
 	// has it yet.
