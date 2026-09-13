@@ -131,10 +131,91 @@ const MAX_QUEUE = 256;
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const HOLD_MS = 25_000;
 
+/** The longest lease the relay will grant. The Go server's MaxLease. */
+const MAX_LEASE_MS = 5 * 60 * 1000;
+
 interface Msg {
+  /**
+   * Stable for the life of the message, including across a redelivery. It is what
+   * a collector deduplicates on: an expired lease followed by a successful one
+   * delivers the same message twice, and the collector has to be able to tell.
+   * Unique within this route, opaque, and not comparable between routes.
+   */
+  id: string;
   seq: number;
   body: string; // base64, exactly as it arrives and leaves
   at: number;
+  /** The collector holding this message, if any, and until when. */
+  lease?: string;
+  until?: number;
+}
+
+/**
+ * The stored value for one route: the messages, and the counters that name them.
+ *
+ * ONE KEY RATHER THAN THREE, so that a put is one write and the queue and its
+ * counters cannot disagree after a partial write.
+ *
+ * THE COUNTERS OUTLIVE THE MESSAGES, which is why this record is not deleted when
+ * the last message is collected. An id must never be reused: a collector
+ * deduplicates on it, so a new message wearing a retired id would be dropped as a
+ * duplicate of something it has nothing to do with. What stays behind is about
+ * thirty bytes of counters, and no ciphertext.
+ *
+ * v is the shape. The shape before leasing was a bare Msg[] with no ids, and the
+ * hosted relay may be holding messages in it when this deploys, so load() upgrades
+ * rather than discarding.
+ */
+interface Queue {
+  v: number;
+  n: number; // next message number
+  l: number; // next lease number
+  msgs: Msg[];
+}
+
+const QUEUE_SHAPE = 2;
+
+/**
+ * Reads the ?lease= parameter. Empty and "0" mean no lease.
+ *
+ * THE SAME SMALL GRAMMAR THE GO SERVER PARSES, and it is small so that both can
+ * implement all of it:
+ *
+ *     lease  = "" | "0" | number unit?
+ *     number = digits [ "." digits ]
+ *     unit   = "ms" | "s" | "m" | "h"      default "s"
+ *
+ * Go's own time.ParseDuration would accept compound durations like "1m30s", and
+ * using it there while hand-parsing here is how ?lease=1m30s ends up working
+ * against one implementation and 400ing against the other.
+ *
+ * Returns the lease in milliseconds, 0 for no lease, or null for a request that
+ * cannot be honoured, which is a 400 rather than a silent fall back to
+ * destructive collection: a collector that asked for a lease and did not get one
+ * would delete its only copy on the strength of a 200.
+ */
+function parseLease(raw: string | null): number | 0 | null {
+  const v = (raw ?? "").trim();
+  if (v === "" || v === "0") return 0;
+  const units: [string, number][] = [
+    ["ms", 1],
+    ["s", 1000],
+    ["m", 60_000],
+    ["h", 3_600_000],
+  ];
+  let unit = 1000;
+  let digits = v;
+  for (const [suffix, ms] of units) {
+    if (v.endsWith(suffix)) {
+      unit = ms;
+      digits = v.slice(0, -suffix.length);
+      break;
+    }
+  }
+  if (digits === "" || !/^[0-9]+(\.[0-9]+)?$/.test(digits)) return null;
+  const ms = Math.floor(Number(digits) * unit);
+  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_LEASE_MS) return null;
+  return ms;
 }
 
 /** Constant-time comparison, so a token is not discoverable by timing. */
@@ -199,6 +280,11 @@ type Reason =
   | "estate-wide-credential"
   | "authority-expired"
   | "authority-unverifiable"
+  // The collection lease, which is a duration in a query string and has nothing
+  // to do with the authorisation lease above. The word is overloaded; the two
+  // are unrelated. heliograph-io/heliograph-cloud#9.
+  | "bad-lease"
+  | "no-such-lease"
   | "internal";
 
 const STATUS: Record<Reason, number> = {
@@ -214,6 +300,8 @@ const STATUS: Record<Reason, number> = {
   "estate-wide-credential": 401,
   "authority-expired": 401,
   "authority-unverifiable": 401,
+  "bad-lease": 400,
+  "no-such-lease": 410,
   internal: 500,
 };
 
@@ -231,6 +319,9 @@ const DETAIL: Record<Reason, string> = {
   "estate-wide-credential": "this tenant refuses estate-wide credentials",
   "authority-expired": "this authorisation lease is outside the window it was minted for",
   "authority-unverifiable": "this authorisation lease could not be verified",
+  "bad-lease": "a lease must be a duration, like 30s",
+  "no-such-lease":
+    "the relay is not holding that lease, so the messages may already have been returned to the queue",
   internal: "could not accept the message",
 };
 
@@ -612,22 +703,84 @@ export class RelayQueue implements DurableObject {
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
+    // The outer Worker has already authorised this. Acknowledging is the second
+    // half of collecting, so it arrives as a POST to the queue's own path with
+    // /ack on the end.
+    if (url.pathname.endsWith("/ack")) {
+      // Checked before the method fallthrough below, or a GET on this path would
+      // be read as a collection of the queue it acknowledges.
+      if (req.method !== "POST") {
+        return json({ error: "acknowledge a lease with POST", reason: "bad-route" }, 405);
+      }
+      return this.ack(req);
+    }
     if (req.method === "POST") return this.put(req);
     if (req.method === "GET") return this.take(url);
     return json({ error: "method not allowed", reason: "bad-route" }, 405);
   }
 
-  private async load(): Promise<Msg[]> {
-    const stored = (await this.state.storage.get<Msg[]>("q")) ?? [];
-    const cut = Date.now() - TTL_MS;
-    const live = stored.filter((m) => m.at >= cut);
-    if (live.length !== stored.length) await this.save(live);
-    return live;
+  /**
+   * Reads the queue, expiring what the seven days have taken and releasing leases
+   * whose deadline has passed.
+   *
+   * `changed` is true when this read alone altered the queue, so a caller that is
+   * not going to write anyway still persists the expiry rather than doing it again
+   * on every request.
+   */
+  private async load(): Promise<{ q: Queue; changed: boolean }> {
+    const raw = await this.state.storage.get<Queue | Msg[]>("q");
+    let q: Queue;
+    let changed = false;
+
+    if (raw === undefined) {
+      q = { v: QUEUE_SHAPE, n: 1, l: 1, msgs: [] };
+    } else if (Array.isArray(raw)) {
+      // The shape before leasing: a bare array, no ids, no counters. The hosted
+      // relay may be holding messages in it when this deploys, and they must
+      // survive that, so they are given ids in the order they were queued.
+      let n = 1;
+      q = {
+        v: QUEUE_SHAPE,
+        n: 1,
+        l: 1,
+        msgs: raw.map((m) => ({ ...m, id: `m${n++}` })),
+      };
+      q.n = n;
+      changed = true;
+    } else {
+      q = raw;
+    }
+
+    const now = Date.now();
+    const cut = now - TTL_MS;
+    const live = q.msgs.filter((m) => m.at >= cut);
+    if (live.length !== q.msgs.length) {
+      q.msgs = live;
+      changed = true;
+    }
+    for (const m of q.msgs) {
+      if (m.lease !== undefined && (m.until ?? 0) <= now) {
+        // The collector holding it never acknowledged. The message stays where it
+        // is in the queue rather than moving to the back, so an abandoned lease
+        // does not reorder the queue for whoever collects next.
+        delete m.lease;
+        delete m.until;
+        changed = true;
+      }
+    }
+    return { q, changed };
   }
 
-  private async save(q: Msg[]): Promise<void> {
-    if (q.length === 0) await this.state.storage.delete("q");
-    else await this.state.storage.put("q", q);
+  /**
+   * Writes the queue back.
+   *
+   * The record stays even when the last message has gone, because the counters in
+   * it must not restart: an id is what a collector deduplicates on, and a new
+   * message wearing a retired id would be dropped as a duplicate of something
+   * else. What is retained is about thirty bytes of counters, and no ciphertext.
+   */
+  private async save(q: Queue): Promise<void> {
+    await this.state.storage.put("q", q);
   }
 
   private async put(req: Request): Promise<Response> {
@@ -645,16 +798,21 @@ export class RelayQueue implements DurableObject {
       return fail("too-large");
     }
 
-    const q = await this.load();
+    const { q } = await this.load();
     // A full queue means the recipient has stopped collecting. Refuse the
     // NEWEST rather than dropping the oldest: silently discarding an earlier
     // message leaves the recipient a gap it reads as a delivered sequence and
     // never learns about, while a refusal reaches the sender, which is the
     // side that can act on it.
-    if (q.length >= MAX_QUEUE) {
+    if (q.msgs.length >= MAX_QUEUE) {
       return fail("queue-full");
     }
-    q.push({ seq: parsed.seq ?? 0, body, at: Date.now() });
+    q.msgs.push({
+      id: `m${q.n++}`,
+      seq: parsed.seq ?? 0,
+      body,
+      at: Date.now(),
+    });
     await this.save(q);
 
     const woken = this.waiters;
@@ -663,38 +821,118 @@ export class RelayQueue implements DurableObject {
     return new Response(null, { status: 202 });
   }
 
+  /** Waits for a put, the hold timeout, or nothing. */
+  private async hold(): Promise<void> {
+    // Long-poll rather than WebSocket. A station runs behind a corporate proxy
+    // that may strip an upgrade header, and a transport that fails on those
+    // estates fails on exactly the estates this exists for.
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((w) => w !== wake);
+        resolve();
+      }, HOLD_MS);
+      const wake = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this.waiters.push(wake);
+    });
+  }
+
+  /** The messages a collector may have: not held under somebody else's lease. */
+  private static available(q: Queue, limit: number): Msg[] {
+    const out: Msg[] = [];
+    for (const m of q.msgs) {
+      if (m.lease !== undefined) continue;
+      if (limit > 0 && out.length >= limit) break;
+      out.push(m);
+    }
+    return out;
+  }
+
+  private static wire(msgs: Msg[]): { id: string; seq: number; body: string }[] {
+    return msgs.map((m) => ({ id: m.id, seq: m.seq, body: m.body }));
+  }
+
   private async take(url: URL): Promise<Response> {
-    let q = await this.load();
-    if (q.length === 0 && url.searchParams.get("wait") !== "0") {
-      // Long-poll rather than WebSocket. A station runs behind a corporate
-      // proxy that may strip an upgrade header, and a transport that fails on
-      // those estates fails on exactly the estates this exists for.
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          this.waiters = this.waiters.filter((w) => w !== wake);
-          resolve();
-        }, HOLD_MS);
-        const wake = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        this.waiters.push(wake);
-      });
-      q = await this.load();
+    const held = parseLease(url.searchParams.get("lease"));
+    if (held === null) {
+      return fail(
+        "bad-lease",
+        `a lease must be a duration of at most ${MAX_LEASE_MS / 1000}s, like 30s`,
+      );
     }
     const limit = Number(url.searchParams.get("limit") ?? "0");
-    let out = q;
-    if (limit > 0 && q.length > limit) {
-      out = q.slice(0, limit);
-      await this.save(q.slice(limit));
-    } else {
-      await this.save([]);
+    const wait = url.searchParams.get("wait") !== "0";
+
+    let { q, changed } = await this.load();
+    if (RelayQueue.available(q, limit).length === 0 && wait) {
+      if (changed) await this.save(q);
+      await this.hold();
+      ({ q, changed } = await this.load());
     }
-    // Delete on collection, not on a separate acknowledgement. A second round
-    // trip would mean holding ciphertext longer in exchange for surviving a
-    // client that crashes mid-read, and that client can ask for the step
-    // again - a cost heliograph already accepts everywhere else.
-    return json(out.map((m) => ({ seq: m.seq, body: m.body })));
+    const out = RelayQueue.available(q, limit);
+
+    if (held > 0) {
+      // Leased: marked, not deleted. The messages stay in the queue until the
+      // collector says it has them, so the window between the relay deleting and
+      // the collector durably storing - which is somebody's only copy of a
+      // capture - stops existing.
+      if (out.length === 0) {
+        if (changed) await this.save(q);
+        return json({ lease: "", until: "", messages: [] });
+      }
+      const lease = `L${q.l++}`;
+      const until = Date.now() + held;
+      for (const m of out) {
+        m.lease = lease;
+        m.until = until;
+      }
+      await this.save(q);
+      return json({
+        lease,
+        until: new Date(until).toISOString(),
+        messages: RelayQueue.wire(out),
+      });
+    }
+
+    // No lease asked for, so delete on collection: exactly what this has always
+    // done, and what every station already deployed expects, down to the bare
+    // array rather than an object. A message under somebody's lease is skipped
+    // rather than taken, because a lease any other collector could override would
+    // guarantee nothing.
+    if (out.length > 0) {
+      const taken = new Set(out.map((m) => m.id));
+      q.msgs = q.msgs.filter((m) => !taken.has(m.id));
+      await this.save(q);
+    } else if (changed) {
+      await this.save(q);
+    }
+    return json(RelayQueue.wire(out));
+  }
+
+  /** Deletes what a collector has confirmed it holds. */
+  private async ack(req: Request): Promise<Response> {
+    let parsed: { lease?: string };
+    try {
+      parsed = (await req.json()) as { lease?: string };
+    } catch {
+      return fail("unreadable-request", "could not read the acknowledgement");
+    }
+    const lease = (parsed.lease ?? "").trim();
+    const { q, changed } = await this.load();
+    const acked = lease === "" ? [] : q.msgs.filter((m) => m.lease === lease);
+    if (acked.length === 0) {
+      if (changed) await this.save(q);
+      // 410 rather than 404: the route exists and the lease is what is gone. It
+      // expired, or this is a repeat of an acknowledgement that already worked,
+      // and a collector's safe response is the same either way - expect the
+      // messages again and recognise them by their ids.
+      return fail("no-such-lease");
+    }
+    q.msgs = q.msgs.filter((m) => m.lease !== lease);
+    await this.save(q);
+    return json({ deleted: acked.length });
   }
 }
 
@@ -748,9 +986,10 @@ export default {
       });
     }
 
-    // /v1/{estate}/{station}/{dir}
+    // /v1/{estate}/{station}/{dir}, and /v1/{estate}/{station}/{dir}/ack
     const parts = url.pathname.split("/").filter(Boolean);
-    if (parts.length !== 4 || parts[0] !== "v1") {
+    const isAck = parts.length === 5 && parts[4] === "ack";
+    if ((parts.length !== 4 && !isAck) || parts[0] !== "v1") {
       return json({ error: "no such route", reason: "bad-route" }, 404);
     }
     const [, estate, station, dir] = parts;
@@ -764,7 +1003,15 @@ export default {
       estate,
       station,
       dir,
-      op: req.method === "POST" ? "write" : "read",
+      // ACKNOWLEDGING IS A READ, even though it arrives as a POST.
+      //
+      // It is the second half of collecting: the side that may collect a queue
+      // is the side that may say it has the messages. Calling it a write would
+      // refuse a station credential acknowledging the requests it just
+      // collected, because a station may not queue a request - and it would ask
+      // the authoriser the wrong question about scope. The Go server routes it
+      // to the same OpRead for the same reason.
+      op: req.method === "POST" && !isAck ? "write" : "read",
       // A length, never a sample. Absent means the client did not say, which
       // the Go server reports the same way.
       bytes: Number(req.headers.get("content-length") ?? -1),
