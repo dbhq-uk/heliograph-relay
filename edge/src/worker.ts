@@ -27,6 +27,18 @@ export interface Env {
    * Set at deploy: `wrangler deploy --var VERSION:$(git rev-parse HEAD)`.
    */
   VERSION?: string;
+  /**
+   * SHA-256 of the bundle that was uploaded, computed by the deploy workflow
+   * from `wrangler deploy --dry-run` over the same source it then deploys.
+   *
+   * A version is a NAME a deployment gives itself. This is a NUMBER anybody
+   * can arrive at independently: `edge/reproduce.sh` rebuilds the bundle from
+   * the tag and prints the same hash, so "the relay in the path is the relay
+   * you read" stops being a sentence and becomes a comparison. A Worker cannot
+   * read its own bundle, so this arrives the same way VERSION does.
+   * See https://heliograph.dbhq.uk/provenance.
+   */
+  BUNDLE_SHA256?: string;
 }
 
 const WHAT_IT_IS =
@@ -76,6 +88,13 @@ function html(body: string): Response {
 // a bug in whatever asked.
 function reportedVersion(env: Env): string {
   return env.VERSION && env.VERSION !== "" ? env.VERSION : "unknown";
+}
+
+// Same rule, same reason: never blank.
+function reportedHash(env: Env): string {
+  return env.BUNDLE_SHA256 && env.BUNDLE_SHA256 !== ""
+    ? env.BUNDLE_SHA256
+    : "unknown";
 }
 
 const MAX_BODY_BYTES = 8 << 20; // 8 MiB, as the Go server
@@ -242,7 +261,17 @@ export class RelayQueue implements DurableObject {
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    if (url.pathname === "/health") return json({ ok: true });
+    // /health carries what a monitoring check has no other way to learn: the
+    // version answering, and the hash of the bundle answering. `ok` stays
+    // first and stays a boolean, because something out there is already
+    // looking for it.
+    if (url.pathname === "/health") {
+      return json({
+        ok: true,
+        version: reportedVersion(env),
+        hash: reportedHash(env),
+      });
+    }
 
     // /version exists so that "the relay you are talking to is the relay you
     // read" is checkable rather than asserted. Without it nobody, including

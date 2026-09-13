@@ -8,8 +8,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -29,7 +32,44 @@ var version = "dev"
 func newServer(store *relay.Store, auth relay.Auth, log *slog.Logger) *relay.Server {
 	s := relay.NewServer(store, auth, log)
 	s.Version = version
+	s.Hash = selfHash()
 	return s
+}
+
+// selfHash is the SHA-256 of this executable, read from disk once at startup.
+//
+// A version string is what somebody passed to the build. This is what is
+// actually running, and it is the number a reader compares against a binary
+// they built themselves from the tag - which is the whole of the reproducible
+// build argument reaching a live service. Documented at
+// https://heliograph.dbhq.uk/provenance.
+//
+// COMPUTED, NOT STAMPED, because a binary cannot contain its own hash: writing
+// the value in changes the value. Reading the file back is the only way, and
+// it costs one read of a few megabytes, once.
+//
+// It never fails the process. A relay that will not start because it could not
+// hash itself would be an outage caused by an introspection endpoint, which is
+// a bad trade for a service whose job is to be reachable; "unknown" is the
+// honest answer and /health gives it.
+//
+// This is the sha256 the no-cryptography rule already allows. It touches the
+// executable on disk and never a message body.
+func selfHash() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 const usage = `heliograph-relay - stores and forwards ciphertext it cannot read

@@ -186,12 +186,15 @@ set once and never in CI.
 ```bash
 cd edge
 npx wrangler secret put HELIOGRAPH_RELAY_ESTATES   # estate:controlToken:stationToken
-npx wrangler deploy --var VERSION:"$(git rev-parse HEAD)"
+npx wrangler deploy \
+  --var VERSION:"$(git rev-parse HEAD)" \
+  --var BUNDLE_SHA256:"$(cd .. && edge/reproduce.sh | sed -n 's/^sha256:[[:space:]]*//p')"
 ```
 
-**Do not drop the `--var`.** Without it the deployment answers
-`{"version":"unknown"}` and nobody, including whoever deployed it, can tell which
-commit is running. A relay whose proposition is that you can read it before you
+**Do not drop either `--var`.** Without them the deployment answers
+`{"version":"unknown"}` and `{"hash":"unknown"}`, and nobody - including whoever
+deployed it - can tell which commit is running or check the bundle against a
+build of their own. A relay whose proposition is that you can read it before you
 run it ought to be able to say which "it" you are reading.
 
 This is also why the workflow exists: a human can pass the wrong commit to
@@ -219,12 +222,51 @@ deserves better than a bare 404.
 which is a true answer somebody can act on, where a blank field reads as a fault
 in whatever asked.
 
-**What this does not yet do**, said plainly because the gap matters: a version
-string is a claim by the deployment about itself. It is not provenance. It does
-not prove the running code was built from that commit, and nothing here signs an
-artefact or verifies one before it is promoted. That is open work, and until it
-lands the honest statement is "the relay reports which commit it believes it is",
-not "the relay is provably the source you read".
+**A version string is still only a claim the deployment makes about itself.** It
+is not provenance: whoever deploys can pass any commit they like to `--var`, and
+before the deploy workflow existed somebody did. The hash below is the half that
+is checkable, and `## Provenance` sets out exactly how far it goes and where it
+stops.
+
+## Provenance
+
+**`GET /health` reports the version serving and the SHA-256 of the artefact
+serving it.**
+
+```bash
+curl https://heliograph-relay.dbhq.uk/health
+{"ok":true,"version":"<commit>","hash":"<sha256 of the worker bundle>"}
+```
+
+That second number is one you can arrive at yourself, without asking us:
+
+```bash
+git clone --branch <the tag> https://github.com/dbhq-uk/heliograph-relay
+cd heliograph-relay && edge/reproduce.sh
+```
+
+Same hash, and the bundle answering your requests is the source you just read.
+A different hash means the deployment is not that tag, which is worth knowing
+loudly. The Go binary answers the same way and needs no help doing it: it hashes
+its own executable at startup, so `hash` there is what is actually running.
+
+**Both builds are reproducible, and CI proves it on every pull request** rather
+than asserting it - each is built twice, from two directories, the second from a
+copy with no `.git`, and a difference fails the build. Measured 2026-09-13, the
+Worker bundle at 25,968 bytes:
+`55cb53fa36888666e93b1128af2cefabdb55113b09c0a76c8bbc81284e907871` twice.
+`npm ci` rather than `npm install` is load-bearing: the lockfile is what pins the
+bundler, and a different bundler emits different bytes.
+
+**Where this stops, stated rather than glossed.** A Worker cannot read its own
+code, so `hash` is the number the deploy workflow computed from the source it
+then deployed - a public log of a public workflow, which is weaker than a binary
+that hashes itself. Nothing here is signed yet. So the honest sentence today is
+"the bundle this tag produces is a number you can check, and the deployment says
+it is serving that number", not "the relay is provably the source you read".
+
+The whole account, including the CLI's side of it, is at
+[heliograph.dbhq.uk/provenance](https://heliograph.dbhq.uk/provenance).
 
 ## Storage
 
@@ -286,7 +328,7 @@ actually kept.
 ```
 POST /v1/{estate}/{station}/{dir}    queue a message   (dir: c2s | s2c)
 GET  /v1/{estate}/{station}/{dir}    collect, long-polling by default
-GET  /health                         liveness, no token
+GET  /health                         liveness, plus the version and hash serving, no token
 GET  /version                        which commit is answering, no token
 GET  /                               the same, plus what this server is
 ```

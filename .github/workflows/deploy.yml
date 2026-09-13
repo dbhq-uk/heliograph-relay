@@ -42,8 +42,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
-          check-latest: true
+          go-version: '1.27.1'
 
       - uses: actions/setup-node@v4
         with:
@@ -57,18 +56,37 @@ jobs:
 
       - name: install
         working-directory: edge
-        run: npm install --no-fund --no-audit
+        # `npm ci`, not `npm install`. The lockfile is the pin: `install` may
+        # resolve wrangler within ^4 and pick up a different bundler, and a
+        # different bundler emits a different bundle - which would make the
+        # hash below unreproducible for anybody following the documentation.
+        run: npm ci --no-fund --no-audit
 
       - name: typecheck
         working-directory: edge
         run: npx tsc --noEmit
+
+      # THE HASH OF WHAT IS ABOUT TO BE DEPLOYED, computed by the same script
+      # `edge/reproduce.sh` gives a stranger. A Worker cannot read its own
+      # bundle, so this is how /health can report the hash of the code that is
+      # answering rather than only the commit somebody typed at a deploy.
+      - name: hash the bundle
+        id: bundle
+        run: |
+          set -euo pipefail
+          out="$(edge/reproduce.sh /tmp/bundle)"
+          echo "$out"
+          echo "sha256=$(echo "$out" | sed -n 's/^sha256:[[:space:]]*//p')" >> "$GITHUB_OUTPUT"
 
       - name: deploy
         working-directory: edge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler deploy --var VERSION:"${{ github.sha }}"
+        run: |
+          npx wrangler deploy \
+            --var VERSION:"${{ github.sha }}" \
+            --var BUNDLE_SHA256:"${{ steps.bundle.outputs.sha256 }}"
 
       # Deploying is not the same as having deployed. Cloudflare propagates,
       # and a green deploy step with the old code still answering is precisely
@@ -84,6 +102,25 @@ jobs:
             sleep 5
           done
           echo "::error::the deploy reported success and the live relay never reported $want"
+          exit 1
+
+      # AND THE HASH, which is the half a version string cannot give you.
+      # Anybody can run edge/reproduce.sh against this tag and get this number;
+      # if the live relay reports a different one, the deployment is not the
+      # source, and the whole provenance claim rests on somebody noticing.
+      - name: prove the live relay reports the bundle that was built
+        run: |
+          set -euo pipefail
+          want='${{ steps.bundle.outputs.sha256 }}'
+          [ -n "$want" ] || { echo "::error::the bundle hash was never computed"; exit 1; }
+          for i in $(seq 1 30); do
+            got="$(curl -fsS https://heliograph-relay.dbhq.uk/health \
+                    | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p')" || got=''
+            [ "$got" = "$want" ] && { echo "live bundle hash is $got"; exit 0; }
+            echo "attempt $i: live hash is '${got:-unreachable}', want $want"
+            sleep 5
+          done
+          echo "::error::the live relay never reported the bundle hash this deploy built"
           exit 1
 
       - name: and that it still passes the contract in production
