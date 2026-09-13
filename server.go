@@ -24,7 +24,7 @@ import (
 // estates fails on exactly the estates this is for.
 type Server struct {
 	store *Store
-	auth  Auth
+	auth  Authoriser
 	log   *slog.Logger
 
 	// wait is how long a poll holds the line before answering empty. Long
@@ -154,7 +154,15 @@ func match(want, got [32]byte) bool {
 	return subtle.ConstantTimeCompare(want[:], got[:]) == 1
 }
 
+// NewServer takes the boolean Auth, which is what a self-hoster writes, and
+// lifts it onto the Authoriser seam.
 func NewServer(store *Store, auth Auth, log *slog.Logger) *Server {
+	return NewAuthorisingServer(store, FromAuth(auth), log)
+}
+
+// NewAuthorisingServer takes the wider seam, which is what the hosted service
+// and anybody else with a control plane uses.
+func NewAuthorisingServer(store *Store, auth Authoriser, log *slog.Logger) *Server {
 	return &Server{
 		store:   store,
 		auth:    auth,
@@ -289,8 +297,22 @@ func token(r *http.Request) string {
 
 func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	estate, station, dir := r.PathValue("estate"), r.PathValue("station"), r.PathValue("dir")
-	if !s.auth.AllowWrite(token(r), estate, station, dir) {
-		fail(w, http.StatusUnauthorized, "not authorised to write that direction for this estate")
+	// The direction is route shape, not credential scope, so it is refused
+	// before the authoriser is asked and refused as a 400. The Worker has
+	// always done it in this order (edge/src/worker.ts:278) and the Go server
+	// answered 401, which is two implementations disagreeing about whose fault
+	// a typo is.
+	if !validDir(dir) {
+		refuse(w, Grant{Reason: ReasonBadRoute})
+		return
+	}
+	g := s.auth.Admit(r.Context(), Request{
+		Credential: token(r), Estate: estate, Station: station, Dir: dir,
+		Op: OpWrite, Bytes: r.ContentLength, At: time.Now(),
+	})
+	if !g.Allow {
+		s.refused(g, estate, station, dir, OpWrite)
+		refuse(w, g)
 		return
 	}
 
@@ -300,7 +322,7 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		Body []byte `json:"body"`
 	}
 	if err := json.NewDecoder(body).Decode(&in); err != nil {
-		fail(w, http.StatusBadRequest, "could not read the message")
+		refuse(w, Grant{Reason: ReasonUnreadable})
 		return
 	}
 	err := s.store.Put(Message{
@@ -308,18 +330,18 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	})
 	switch {
 	case errors.Is(err, ErrTooLarge):
-		fail(w, http.StatusRequestEntityTooLarge, err.Error())
+		refuse(w, Grant{Reason: ReasonTooLarge, Detail: err.Error()})
 		return
 	case errors.Is(err, ErrQueueFull):
 		// 429 rather than 500: it is the sender's problem to slow down, and a
 		// 5xx would send them looking for a fault on this side.
-		fail(w, http.StatusTooManyRequests, err.Error())
+		refuse(w, Grant{Reason: ReasonQueueFull, Detail: err.Error()})
 		return
 	case errors.Is(err, ErrBadRoute):
-		fail(w, http.StatusBadRequest, err.Error())
+		refuse(w, Grant{Reason: ReasonBadRoute, Detail: err.Error()})
 		return
 	case err != nil:
-		fail(w, http.StatusInternalServerError, "could not accept the message")
+		refuse(w, Grant{Reason: ReasonInternal})
 		return
 	}
 
@@ -333,8 +355,17 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	estate, station, dir := r.PathValue("estate"), r.PathValue("station"), r.PathValue("dir")
-	if !s.auth.AllowRead(token(r), estate, station, dir) {
-		fail(w, http.StatusUnauthorized, "not authorised for this estate")
+	if !validDir(dir) {
+		refuse(w, Grant{Reason: ReasonBadRoute})
+		return
+	}
+	g := s.auth.Admit(r.Context(), Request{
+		Credential: token(r), Estate: estate, Station: station, Dir: dir,
+		Op: OpRead, At: time.Now(),
+	})
+	if !g.Allow {
+		s.refused(g, estate, station, dir, OpRead)
+		refuse(w, g)
 		return
 	}
 	limit := 0
@@ -344,7 +375,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 
 	msgs, err := s.store.Take(estate, station, dir, limit)
 	if err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		refuse(w, Grant{Reason: ReasonBadRoute, Detail: err.Error()})
 		return
 	}
 	if len(msgs) == 0 && r.URL.Query().Get("wait") != "0" {
@@ -409,10 +440,40 @@ func (s *Server) wake(k string) {
 	}
 }
 
-func fail(w http.ResponseWriter, code int, msg string) {
+// refuse writes a refusal, and every refusal carries a machine-readable reason
+// beside the sentence.
+//
+// The sentence is for a person and the reason is for a program, and the two are
+// separate fields because a client that has to match on English prose is a
+// client that breaks when the prose improves.
+func refuse(w http.ResponseWriter, g Grant) {
+	if g.Reason == ReasonAllowed {
+		// A refusal that names no reason must still refuse. This is not
+		// hypothetical: the first version of RemoteAuth returned a bare
+		// Grant{Allow: false} on an unreachable authoriser, and because the
+		// zero Reason is "allowed", Status() answered 200 and the relay handed
+		// out a success with an error body in it. The test that caught it is
+		// TestARefusalWithNoReasonStillRefuses.
+		g.Reason = ReasonBadCredential
+	}
+	detail := g.Detail
+	if detail == "" {
+		detail = g.Reason.Detail()
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	w.WriteHeader(g.Reason.Status())
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error":  detail,
+		"reason": string(g.Reason),
+	})
+}
+
+// refused logs a refusal. Metadata only, and the reason, because the reason is
+// what an operator watching a graph needs: a rise in authoriser-unavailable is
+// our fault and a rise in bad-credential is somebody else's.
+func (s *Server) refused(g Grant, estate, station, dir string, op Op) {
+	s.log.Info("refused", "estate", estate, "station", station, "dir", dir,
+		"op", string(op), "reason", string(g.Reason), "status", g.Reason.Status())
 }
 
 // FingerprintToken is for an operator who has to say which token is configured

@@ -103,8 +103,8 @@ request, even for its own station. `server.go` is where that is enforced and why
 
 An estate whose two tokens are identical is refused, because that collapses the
 only scope separation there is. The Go server refuses to start and names the
-estate (`cmd/heliograph-relay/main.go:70-75`). The Worker skips that estate
-(`edge/src/worker.ts:60`), which fails closed but is harder to diagnose.
+estate (`cmd/heliograph-relay/main.go:107-112`). The Worker skips that estate
+(`edge/src/worker.ts:125`), which fails closed but is harder to diagnose.
 
 ### Storage
 
