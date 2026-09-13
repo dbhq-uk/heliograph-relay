@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,8 @@ expects estates e1 (ctl/stn) and e2 (other-ctl/other-stn)
   HELIOGRAPH_CONF_AUTHORISER  run a control plane on this address, and assert
                               the outage section. The relay under test must
                               already be pointed at it. Example: 127.0.0.1:9797
+  HELIOGRAPH_CONF_TENANCY     the relay under test refuses estate-wide
+                              credentials, so assert per-station isolation too
 `
 
 func main() {
@@ -72,6 +75,10 @@ func main() {
 		}
 		defer cp.stop()
 		target.AuthoriserSaw = cp.Saw
+		// The per-station isolation section only means anything against a relay
+		// that refuses estate-wide credentials, so the harness has to be told
+		// the relay under test was started that way.
+		target.Tenancy = os.Getenv("HELIOGRAPH_CONF_TENANCY") != ""
 		// The lever. Calling it takes the authoriser away the way a database
 		// failure or a bad deployment would, and the returned function puts it
 		// back.
@@ -149,6 +156,7 @@ func (c *controlPlane) decide(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Credential string `json:"credential"`
 		Estate     string `json:"estate"`
+		Station    string `json:"station"`
 		Dir        string `json:"dir"`
 		Op         string `json:"op"`
 	}
@@ -156,6 +164,17 @@ func (c *controlPlane) decide(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not read the decision request", http.StatusBadRequest)
 		return
 	}
+	// The tenancy credentials are answered first, because they are bound to one
+	// station each and an ordinary estate lookup would not see that.
+	if sc, ok := scopeFor(in.Credential, in.Estate, in.Station, in.Dir, in.Op); ok {
+		reply(w, true, "", sc)
+		return
+	}
+	if _, bound := tenancy[in.Credential]; bound {
+		reply(w, false, "out-of-scope", nil)
+		return
+	}
+
 	allow, reason := false, "bad-credential"
 	pair, known := c.tokens[strings.TrimSpace(in.Estate)]
 	switch {
@@ -177,9 +196,83 @@ func (c *controlPlane) decide(w http.ResponseWriter, r *http.Request) {
 		}
 		allow = in.Credential == pair[1]
 	}
-	if allow {
-		reason = ""
+	if !allow {
+		reply(w, false, reason, nil)
+		return
+	}
+	// Station-scoped, for the station being asked about. A per-request
+	// authoriser grants exactly one station at a time, and saying so is what
+	// lets a hosted relay tell a narrow grant from a wide one.
+	read, write := []string{"s2c"}, []string{"c2s"}
+	if in.Credential == pair[1] {
+		read, write = []string{"c2s"}, []string{"s2c"}
+	}
+	reply(w, true, "", stationScope(in.Estate, in.Station, read, write))
+}
+
+// reply writes one decision.
+func reply(w http.ResponseWriter, allow bool, reason string, scope map[string]any) {
+	out := map[string]any{"allow": allow, "reason": reason}
+	if scope != nil {
+		out["scope"] = scope
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"allow": allow, "reason": reason})
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// tenancy is the two-customer policy the contract's per-station section needs.
+//
+// Two customers under ONE estate identifier, each credential bound to its own
+// station. That binding is the whole point: a relay that granted whatever
+// station was asked for would pass the isolation section without enforcing
+// anything.
+var tenancy = map[string]struct {
+	station string
+	read    []string
+	write   []string
+}{
+	conformance.TenantAlphaStation: {conformance.TenantAlpha, []string{"c2s"}, []string{"s2c"}},
+	conformance.TenantAlphaControl: {conformance.TenantAlpha, []string{"s2c"}, []string{"c2s"}},
+	conformance.TenantBravoStation: {conformance.TenantBravo, []string{"c2s"}, []string{"s2c"}},
+	conformance.TenantBravoControl: {conformance.TenantBravo, []string{"s2c"}, []string{"c2s"}},
+}
+
+// scopeFor answers the scope half of a decision.
+//
+// Ordinary estates are answered station-scoped for the station being asked
+// about, which is what a per-request authoriser genuinely grants. The tenancy
+// credentials are answered from their binding, and TenantWide is answered
+// estate-wide on purpose so a hosted relay has something to refuse.
+func scopeFor(credential, estate, station, dir, op string) (map[string]any, bool) {
+	if credential == conformance.TenantWide {
+		return map[string]any{
+			"estate": estate, "stations": []string{}, "allStations": true,
+			"read": []string{"c2s", "s2c"}, "write": []string{"c2s", "s2c"},
+		}, true
+	}
+	if t, ok := tenancy[credential]; ok {
+		if estate != conformance.TenantEstate || station != t.station {
+			return nil, false
+		}
+		allowed := t.read
+		if op == "write" {
+			allowed = t.write
+		}
+		if !slices.Contains(allowed, dir) {
+			return nil, false
+		}
+		return map[string]any{
+			"estate": estate, "stations": []string{t.station}, "allStations": false,
+			"read": t.read, "write": t.write,
+		}, true
+	}
+	return nil, false
+}
+
+// stationScope narrows an ordinary estate decision to the station asked about.
+func stationScope(estate, station string, read, write []string) map[string]any {
+	return map[string]any{
+		"estate": estate, "stations": []string{station}, "allStations": false,
+		"read": read, "write": write,
+	}
 }
