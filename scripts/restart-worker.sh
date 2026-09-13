@@ -8,6 +8,7 @@
 #   WRANGLER_PORT      the port to serve on     (default 8787)
 #   WRANGLER_PERSIST   the state directory      (default .wrangler/conformance-state)
 #   WRANGLER_ESTATES   estate tokens            (default the conformance pair)
+#   WRANGLER_LEASE_KEY authorisation lease key  (default the contract's public key)
 #   WRANGLER_LOG       where to append output   (default /tmp/wrangler.log)
 #   WRANGLER_PIDFILE   where the pid is kept    (default /tmp/wrangler-dev.pid)
 #
@@ -31,6 +32,11 @@ set -eu
 port=${WRANGLER_PORT:-8787}
 persist=${WRANGLER_PERSIST:-.wrangler/conformance-state}
 estates=${WRANGLER_ESTATES:-e1:ctl:stn,e2:other-ctl:other-stn}
+# The contract's published Ed25519 PUBLIC key, so a worker started by this
+# script honours the leases the suite mints. A test fixture rather than a
+# secret: the matching seed is a constant in conformance/, and the relay holds
+# only this half. heliograph-io/heliograph-cloud#75.
+lease_key=${WRANGLER_LEASE_KEY:-79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664}
 log=${WRANGLER_LOG:-/tmp/wrangler.log}
 pidfile=${WRANGLER_PIDFILE:-/tmp/wrangler-dev.pid}
 
@@ -58,6 +64,7 @@ fi
 # node_modules/.bin/wrangler rather than npx, so the recorded pid is wrangler's
 # own and a signal reaches it rather than a wrapper that may not pass it on.
 ./node_modules/.bin/wrangler dev --port "$port" --local --persist-to "$persist" \
-  --var HELIOGRAPH_RELAY_ESTATES:"$estates" >>"$log" 2>&1 &
+  --var HELIOGRAPH_RELAY_ESTATES:"$estates" \
+  --var HELIOGRAPH_RELAY_LEASE_KEY:"$lease_key" >>"$log" 2>&1 &
 echo $! >"$pidfile"
 echo "restart-worker: pid $(cat "$pidfile"), port $port, state $persist" >&2

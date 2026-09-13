@@ -85,6 +85,10 @@ const usage = `heliograph-relay - stores and forwards ciphertext it cannot read
                                and HELIOGRAPH_RELAY_ESTATES is not read
   HELIOGRAPH_RELAY_HOSTED      refuse any credential not scoped to named
                                stations, including one that declines to say
+  HELIOGRAPH_RELAY_LEASE_KEY   the Ed25519 PUBLIC key authorisation leases are
+                               signed with, hex or base64. Unset means every
+                               lease is refused. This relay never needs the
+                               private half and refuses one if given it
   HELIOGRAPH_RELAY_SPOOL       directory for durable messages (default: none,
                                so a restart drops what was not collected)
 
@@ -142,14 +146,27 @@ func main() {
 		// a fault that was ours. So the lease is read, and refused for the
 		// reason it was actually refused for.
 		//
-		// No verifier is supplied, because there is none to supply: verifying a
-		// signature needs a primitive validate.yml forbids, and the options are
-		// written up on heliograph-io/heliograph-cloud#75 rather than settled by
-		// relaxing the rule. Until one exists, every lease is refused, which is
-		// the only safe default.
-		log.Info("authorisation leases are recognised and refused: no verifier is configured, so every lease fails closed",
-			"maximumLeaseLife", relay.MaxAuthorityLife.String())
-		return &relay.AuthorityAuth{Inner: a}
+		leases := &relay.AuthorityAuth{Inner: a}
+		if key := strings.TrimSpace(os.Getenv("HELIOGRAPH_RELAY_LEASE_KEY")); key != "" {
+			pub, err := relay.ParseEd25519PublicKey(key)
+			if err != nil {
+				// Refused rather than started with a verifier that silently
+				// refuses everything. That symptom is identical to a control
+				// plane signing with the wrong key, and it would send somebody
+				// looking on the far side of the gap.
+				fmt.Fprintf(os.Stderr, "heliograph-relay: HELIOGRAPH_RELAY_LEASE_KEY: %v\n", err)
+				os.Exit(2)
+			}
+			leases.Verify = relay.Ed25519Verifier(pub)
+			// The key itself, because it is public and an operator has to be
+			// able to say which one this relay trusts without asking anybody.
+			log.Info("authorisation leases are verified against a configured Ed25519 public key",
+				"key", key, "maximumLeaseLife", relay.MaxAuthorityLife.String())
+		} else {
+			log.Info("authorisation leases are recognised and refused: no verification key is configured, so every lease fails closed",
+				"maximumLeaseLife", relay.MaxAuthorityLife.String())
+		}
+		return leases
 	}
 
 	if stations != "" {

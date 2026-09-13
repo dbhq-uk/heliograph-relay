@@ -96,6 +96,15 @@ type Target struct {
 	// earned.
 	Tenancy bool
 
+	// SignLease, when set, signs a lease payload with the key the relay under
+	// test was configured to verify against.
+	//
+	// The harness supplies it rather than this package doing it, for the same
+	// reason the outage lever is supplied: signing needs a private key, and a
+	// specification that held one would be a specification that could mint.
+	// Leaving it nil skips the signed-lease section and says so.
+	SignLease func(payload string) []byte
+
 	// AuthoriserSaw returns everything the harness's control plane has been
 	// sent since the run began, concatenated and unmodified.
 	//
@@ -139,6 +148,57 @@ const (
 	// hosted tenant must refuse it, and must say that is why.
 	TenantWide = "estate-wide-credential"
 )
+
+// The keypair this contract signs authorisation leases with.
+//
+// PUBLISHED ON PURPOSE, AND NOT A SECRET. It exists so that a relay under test
+// can be started with LeaseKey and the suite can then mint leases it will
+// accept. A relay configured with this key trusts anybody holding this file,
+// which is every reader: it is a test fixture and must never be deployed.
+//
+// Derived from a fixed seed so both implementations are configured from one
+// number and cannot quietly disagree about which key they trust.
+//
+// heliograph-io/heliograph-cloud#75.
+const (
+	// LeaseSeed is the 32-byte Ed25519 seed, hex. The harness signs with it.
+	LeaseSeed = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+	// LeaseKey is the public half, hex. The relay under test verifies with it.
+	LeaseKey = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"
+)
+
+// Lease builds a lease in the wire format, signed by sign.
+//
+// The format is written out here rather than imported from the Go server,
+// because this package is the specification and importing one implementation
+// would make it a second copy of that implementation instead. A second encoder
+// is the point: if the two disagree about a byte, one of them is wrong and this
+// is where it shows.
+//
+//	hl1.<base64url(payload)>.<base64url(signature)>
+func Lease(sign func(payload string) []byte, estate string, stations, read, write []string, notBefore, expires time.Time, epoch int64) string {
+	payload := map[string]any{
+		"e": estate, "nbf": notBefore.Unix(), "exp": expires.Unix(),
+	}
+	if len(stations) > 0 {
+		payload["s"] = stations
+	}
+	if len(read) > 0 {
+		payload["r"] = read
+	}
+	if len(write) > 0 {
+		payload["w"] = write
+	}
+	if epoch != 0 {
+		payload["ep"] = epoch
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	body := base64.RawURLEncoding.EncodeToString(raw)
+	return "hl1." + body + "." + base64.RawURLEncoding.EncodeToString(sign(body))
+}
 
 // refusal is what a relay says when it says no.
 //
@@ -584,6 +644,78 @@ func Run(t Target) []Result {
 		code, _ = t.put(t.Estate, uniq+"-dotted", "c2s", t.Control, 1, []byte("x"))
 		ok("an ordinary credential is still not read as a lease", code == 202,
 			fmt.Sprintf("got %d", code))
+	}
+
+	// --- a lease the relay can actually verify ------------------------------
+	// The other half of heliograph-io/heliograph-cloud#75, and the half that
+	// makes the feature worth having: a relay honours a lease the control plane
+	// signed, with no network call, so a control-plane outage is not a transport
+	// outage. Both implementations verify, and NEITHER can sign.
+	if t.SignLease != nil {
+		leaseStation := uniq + "-leased"
+		now := time.Now()
+		live := Lease(t.SignLease, t.Estate, []string{leaseStation},
+			[]string{"c2s"}, []string{"s2c"}, now.Add(-time.Minute), now.Add(10*time.Minute), 0)
+
+		code, why, _ := t.putR(t.Estate, leaseStation, "s2c", live, 1, []byte("status"))
+		ok("a lease signed by the control plane is honoured", code == 202,
+			fmt.Sprintf("got %d %q", code, why.Reason))
+
+		// The control credential queues, and the leased station collects, so the
+		// lease is doing real work rather than being accepted and ignored.
+		code, _ = t.put(t.Estate, leaseStation, "c2s", t.Control, 1, []byte("a request"))
+		ok("a control credential can queue for a leased station", code == 202,
+			fmt.Sprintf("got %d", code))
+		code, got, _ = t.take(t.Estate, leaseStation, "c2s", live)
+		ok("a leased station collects its own requests", code == 200 && len(got) == 1,
+			fmt.Sprintf("got %d with %d messages", code, len(got)))
+
+		// The asymmetry survives leasing.
+		code, _ = t.put(t.Estate, leaseStation, "c2s", live, 1, []byte("evil"))
+		ok("a leased station still may NOT queue a request for itself", code != 202,
+			fmt.Sprintf("got %d", code))
+
+		// Out of its own scope.
+		code, _ = t.put(t.Estate, uniq+"-elsewhere", "s2c", live, 1, []byte("x"))
+		ok("a lease does not reach a station it does not name", code != 202,
+			fmt.Sprintf("got %d", code))
+
+		// Expired.
+		expired := Lease(t.SignLease, t.Estate, []string{leaseStation},
+			[]string{"c2s"}, []string{"s2c"}, now.Add(-20*time.Minute), now.Add(-10*time.Minute), 0)
+		code, why, _ = t.putR(t.Estate, leaseStation, "s2c", expired, 1, []byte("x"))
+		ok("an expired lease is refused", code != 202, fmt.Sprintf("got %d", code))
+		ok("and says it expired rather than blaming the credential",
+			why.Reason == "authority-expired", fmt.Sprintf("reason=%q", why.Reason))
+
+		// Signed by somebody else. The signature is the right length and the
+		// payload is well formed, so only the key tells them apart.
+		forged := Lease(func(payload string) []byte {
+			s := make([]byte, 64)
+			copy(s, payload)
+			return s
+		}, t.Estate, []string{leaseStation}, []string{"c2s"}, []string{"s2c"},
+			now.Add(-time.Minute), now.Add(10*time.Minute), 0)
+		code, why, _ = t.putR(t.Estate, leaseStation, "s2c", forged, 1, []byte("x"))
+		ok("a lease signed by the wrong key is refused", code != 202, fmt.Sprintf("got %d", code))
+		ok("and the refusal names the lease rather than the credential",
+			why.Reason == "authority-unverifiable", fmt.Sprintf("reason=%q", why.Reason))
+
+		// A payload edited after signing. Same signature, wider scope: this is
+		// the attack the signature exists to stop, and it must fail because the
+		// signature covers the ENCODED payload rather than the decoded fields.
+		parts := strings.Split(live, ".")
+		if len(parts) == 3 {
+			wide := Lease(t.SignLease, t.Estate, nil, []string{"c2s", "s2c"},
+				[]string{"c2s", "s2c"}, now.Add(-time.Minute), now.Add(10*time.Minute), 0)
+			tampered := strings.Split(wide, ".")[0] + "." + strings.Split(wide, ".")[1] + "." + parts[2]
+			code, _ = t.put(t.Estate, leaseStation, "c2s", tampered, 1, []byte("x"))
+			ok("a lease widened after signing no longer verifies", code != 202,
+				fmt.Sprintf("got %d", code))
+		}
+	} else {
+		ok("SKIPPED: the signed-lease section needs a signing key this harness did not supply",
+			true, "")
 	}
 
 	// --- estates are isolated --------------------------------------------

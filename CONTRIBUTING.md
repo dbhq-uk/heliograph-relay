@@ -35,12 +35,21 @@ needed a library for would be something it should not be doing, and every
 dependency is a third party who can change what is in the path of somebody
 else's estate.
 
-### No cryptography beyond a constant-time token comparison
+### No cryptography beyond hashing and verification
 
-`crypto/sha256` and `crypto/subtle` only, in Go, and none at all in the Worker.
-The security claim is that there is no key here to leak and no plaintext to
-subpoena, and the way that claim stays checkable is that a reviewer can grep for
-it.
+`crypto/sha256`, `crypto/subtle` and `crypto/ed25519` in Go; `importKey` and
+`verify` and nothing else in the Worker. The security claim is that there is no
+key here **worth stealing** and no plaintext to subpoena.
+
+**Ed25519 is permitted for verification and forbidden for signing**, and that
+distinction is not left to a grep. CI builds `cmd/heliograph-relay` and reads
+its symbol table: Go links only reachable code, so a binary with no route to
+constructing a private key has no code path that could sign. A bundle has no
+symbol table, so the Worker is allowlisted to the two calls that verify.
+
+If you find yourself wanting to sign something here, the answer is no. A relay
+that could mint its own authority could authorise itself for any estate, which
+is the claim the whole component rests on.
 
 **Do not weaken this rule to make a feature fit.** If something genuinely needs
 a primitive the rule forbids, say so in the issue with the options and their
@@ -48,19 +57,31 @@ costs, and let somebody decide. Hand-rolling a primitive in order to pass the
 grep is worse than importing one, because it evades the check rather than
 satisfying it.
 
-This has already cost something real, and the cost is recorded rather than
-absorbed. Authorisation leases (`authlease.go`) are signed, and **neither
-implementation can check the signature.** Ed25519 is the right primitive and is
-forbidden here. HMAC-SHA256 could be built from `crypto/sha256` alone and would
-pass the rule as written, and is refused twice over: a relay able to verify a
-symmetric MAC is a relay able to **mint** any lease it likes, which gives up
-"the relay holds no keys"; and hand-rolling it to get past the grep is the thing
-the paragraph above forbids.
+This has been exercised once, and it is worth reading as a worked example
+because it ended in the rule narrowing rather than holding.
 
-So the lease format, every local check and an `AuthorityVerifier` seam are
-published, the primitive is not chosen here, and a relay with no verifier
-refuses every lease. The options and their costs are written up on the issue.
-That is what "say so and let somebody decide" looks like in practice.
+Authorisation leases (`authlease.go`) are signed, and honouring one means
+checking a signature. The rule as it stood forbade every way of doing that. Four
+options were costed on the issue and the owner chose **verification-only
+Ed25519, in both implementations**:
+
+- **HMAC-SHA256** would have needed no new primitive and was refused anyway. It
+  is symmetric, so a relay able to verify is a relay able to **mint**. It passes
+  the old rule and ends the claim, which is exactly the wrong way round
+- **A published seam with no primitive** shipped first and was not enough. A
+  relay that refuses every lease has no outage protection, and the hosted relay
+  most customers touch could never have had a verifier at all
+- **Ed25519, verification only** narrows the *sentence* and leaves the *claim*
+  intact, because a public key is not a secret
+
+What made it a decision rather than a preference: the sentence being narrowed
+was published in three documents as a reason to trust this component, so it was
+corrected in each of them with the old wording visible, and the narrower rule is
+now enforced by the linker rather than asserted in prose.
+
+The process that got there is the point. **Say so in the issue with the options
+and their costs, and let somebody decide.** Do not hand-roll a primitive to get
+past the grep, and do not quietly widen the rule to "cryptography is fine".
 
 ### One contract, every implementation
 

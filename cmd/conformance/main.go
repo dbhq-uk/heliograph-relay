@@ -6,6 +6,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -58,6 +60,11 @@ expects estates e1 (ctl/stn) and e2 (other-ctl/other-stn)
                               already be pointed at it. Example: 127.0.0.1:9797
   HELIOGRAPH_CONF_TENANCY     the relay under test refuses estate-wide
                               credentials, so assert per-station isolation too
+
+The relay under test should be started with its lease verification key set to
+the contract's published public key, or the signed-lease section is skipped:
+
+  HELIOGRAPH_RELAY_LEASE_KEY=79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664
 `
 
 func main() {
@@ -124,6 +131,20 @@ func main() {
 	}
 	if *restart != "" {
 		target.Disrupt = restarter(base, *restart, *health)
+	}
+
+	// The harness signs, and the relay under test only verifies. This is the
+	// one place in the repository that holds a private key, it is a published
+	// test fixture rather than a secret, and it is never deployed.
+	//
+	// TestTheSigningCheckCanTellASignerFromAVerifier builds THIS binary and
+	// fails if it does not link a signing path, which is how the check on the
+	// relay binary is known to discriminate rather than merely pass.
+	if seed, err := hex.DecodeString(conformance.LeaseSeed); err == nil && len(seed) == ed25519.SeedSize {
+		priv := ed25519.NewKeyFromSeed(seed)
+		target.SignLease = func(payload string) []byte {
+			return ed25519.Sign(priv, []byte(payload))
+		}
 	}
 
 	rs := conformance.Run(target)

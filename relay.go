@@ -1,13 +1,27 @@
 // Package relay stores and forwards opaque messages between a control and a
 // station, and can read none of them.
 //
-// THERE IS NO CRYPTOGRAPHY IN THIS PACKAGE, and that is the design rather than
-// an omission. Every message arrives already sealed by the client, bound to its
-// estate, its station, its direction and its sequence number, and signed. This
-// server sees a byte slice, a routing key and a length.
+// THERE IS NO KEY HERE WORTH STEALING AND NO PLAINTEXT TO SUBPOENA, and that is
+// the design rather than an omission. Every message arrives already sealed by
+// the client, bound to its estate, its station, its direction and its sequence
+// number, and signed. This server sees a byte slice, a routing key and a length.
 //
-// That is what makes the security claim checkable: there is no key here to
-// leak, no plaintext to subpoena, and no code path that could be persuaded to
+// THIS COMMENT USED TO SAY "THERE IS NO CRYPTOGRAPHY IN THIS PACKAGE", and it
+// is corrected here rather than quietly edited, because it was offered as a
+// reason to trust this component. That sentence was a PROXY for the claim above,
+// and the proxy has narrowed while the claim has not: verify.go verifies
+// authorisation lease signatures with crypto/ed25519, and a public key is not a
+// secret. An attacker who takes everything this relay holds gets a key that
+// checks signatures and makes none.
+//
+// The narrowing is held in place by the linker rather than by this paragraph.
+// TestTheRelayBinaryCannotSignALease reads the built binary's symbol table and
+// fails if any route to constructing an ed25519 private key is reachable from
+// main, so "this relay cannot mint its own authority" is a measurement.
+// heliograph-io/heliograph-cloud#75 has the decision and the options it beat.
+//
+// What still makes the security claim checkable: there is no private key here
+// to leak, no plaintext to subpoena, and no code path that could be persuaded to
 // produce either. A reviewer can establish it by reading one small file rather
 // than by trusting an operator.
 //

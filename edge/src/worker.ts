@@ -51,6 +51,16 @@ export interface Env {
    */
   HELIOGRAPH_RELAY_HOSTED?: string;
   /**
+   * The Ed25519 PUBLIC key authorisation leases are signed with, hex or base64.
+   *
+   * Unset means every lease is refused. This relay never needs the private half
+   * and refuses one if given it: a 64-byte key is an Ed25519 private key whose
+   * last 32 bytes are the public half, and accepting it would leave signing
+   * material in the configuration of a component whose whole claim is that it
+   * holds no key worth stealing. heliograph-io/heliograph-cloud#75.
+   */
+  HELIOGRAPH_RELAY_LEASE_KEY?: string;
+  /**
    * The commit this was deployed from. A var rather than a secret, because the
    * entire point is that anybody can read it and compare it against `main`.
    * Set at deploy: `wrangler deploy --var VERSION:$(git rev-parse HEAD)`.
@@ -645,35 +655,191 @@ function truthy(v: string | undefined): boolean {
 }
 
 /**
- * An authorisation lease, which this implementation refuses.
+ * Authorisation leases, VERIFIED HERE AND NEVER SIGNED HERE.
  *
- * heliograph-io/heliograph-cloud#75 defines a bounded, scoped, signed grant the
- * relay validates with no network call, so that a control-plane outage is not a
- * transport outage. The Go server carries the format, every local check, and a
- * seam an operator fills with a verifier.
+ * heliograph-io/heliograph-cloud#75 is a bounded, scoped, signed grant the relay
+ * validates with no network call, so that a control-plane outage is not a
+ * transport outage. This implementation is the hosted relay almost every
+ * customer touches, so a lease that could not be honoured here would make the
+ * whole feature theatre - which is why the rule against cryptography at the
+ * edge narrowed to permit verification, rather than the feature being dropped.
  *
- * THIS IMPLEMENTATION CANNOT HAVE ONE. `.github/workflows/validate.yml` forbids
- * cryptography at the edge outright, and verifying a signature is cryptography.
- * Hand-rolling a primitive to get past the grep would evade that rule rather
- * than satisfy it, which CONTRIBUTING.md says plainly.
+ * WHAT NARROWED AND WHAT DID NOT. The claim is that there is no key here worth
+ * stealing. A public key is not a secret, so the claim is untouched. The
+ * SENTENCE that used to stand in for it, "no cryptography at the edge", is what
+ * changed, and `.github/workflows/validate.yml` now says the narrower thing it
+ * always meant: importKey and verify, never sign, never generateKey.
  *
- * So a lease is RECOGNISED and REFUSED, with the reason a Go relay that has no
- * verifier configured gives for the same credential. The two implementations
- * agree about what happens; they disagree about what an operator can do next,
- * and the README says so rather than averaging over it.
- *
- * The local checks are deliberately absent rather than written and unreachable.
- * Validation that can never accept anything is validation nobody exercises, and
- * it would read as support for a feature this implementation does not have.
+ * The key is imported with `extractable: false` and `["verify"]` as its only
+ * usage, so the runtime itself refuses to sign with it or hand it back.
  */
 function looksLikeAuthority(credential: string): boolean {
   const parts = credential.split(".");
   return parts.length === 3 && parts[0] === "hl1" && parts[1] !== "";
 }
 
+function fromBase64Url(s: string): Uint8Array | null {
+  // atob wants standard base64 with padding; a lease carries the unpadded URL
+  // alphabet because it travels in a header.
+  const padded = s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4);
+  try {
+    const raw = atob(padded);
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/** The only algorithm this relay touches, and only to verify with it. */
+const ED25519 = { name: "Ed25519" } as const;
+
+const ED25519_PUBLIC_KEY_BYTES = 32;
+const ED25519_PRIVATE_KEY_BYTES = 64;
+
+/**
+ * Read the configured public key.
+ *
+ * Hex, standard base64 or unpadded base64url, because an operator will have it
+ * in whichever spelling produced it. A 64-byte key is refused by name: that is
+ * an Ed25519 PRIVATE key whose last 32 bytes are the public half, and a
+ * truncating parser would leave signing material in this relay's configuration.
+ */
+function parsePublicKey(spec: string): Uint8Array | null {
+  const s = spec.trim();
+  if (!s) return null;
+  let raw: Uint8Array | null = null;
+  if (s.length === ED25519_PUBLIC_KEY_BYTES * 2 && /^[0-9a-fA-F]+$/.test(s)) {
+    raw = Uint8Array.from(s.match(/../g)!.map((h) => parseInt(h, 16)));
+  } else {
+    raw = fromBase64Url(s);
+  }
+  if (raw && raw.length === ED25519_PRIVATE_KEY_BYTES) {
+    // Named rather than silently truncated. An Ed25519 private key's last 32
+    // bytes ARE the public half, so a lenient parser would accept one and leave
+    // signing material in the configuration of a relay whose whole claim is
+    // that it holds no key worth stealing.
+    console.error(
+      "HELIOGRAPH_RELAY_LEASE_KEY is a 64-byte Ed25519 PRIVATE key. This relay wants the 32-byte public half, never needs a private key, and refuses one. Every lease will be refused until it is corrected.",
+    );
+    return null;
+  }
+  if (!raw || raw.length !== ED25519_PUBLIC_KEY_BYTES) return null;
+  return raw;
+}
+
+/**
+ * The imported key, cached per isolate.
+ *
+ * importKey is asynchronous and the key does not change while the isolate
+ * lives, so importing it per request would be work in the data path for no
+ * reason. Cached by the configured string, so a changed binding re-imports.
+ */
+let leaseKey: Promise<CryptoKey | null> | null = null;
+let leaseKeyFrom = "";
+
+function verificationKey(spec: string): Promise<CryptoKey | null> {
+  if (leaseKey && leaseKeyFrom === spec) return leaseKey;
+  leaseKeyFrom = spec;
+  const raw = parsePublicKey(spec);
+  if (!raw) {
+    leaseKey = Promise.resolve(null);
+    return leaseKey;
+  }
+  // extractable: false, and "verify" as the only usage. The runtime will not
+  // sign with this key or give it back, whatever this code later asks for.
+  const imported = crypto.subtle.importKey("raw", raw as BufferSource, ED25519, false, ["verify"]);
+  leaseKey = imported.catch(() => null);
+  return leaseKey;
+}
+
+/** Verify a lease's signature. Fails closed on anything unexpected. */
+async function verifyAuthority(spec: string, credential: string): Promise<boolean> {
+  const parts = credential.split(".");
+  if (parts.length !== 3) return false;
+  const key = await verificationKey(spec);
+  if (!key) return false;
+  const sig = fromBase64Url(parts[2]);
+  if (!sig || sig.length !== 64) return false;
+  try {
+    const payload = new TextEncoder().encode(parts[1]) as BufferSource;
+    return await crypto.subtle.verify(ED25519, key, sig as BufferSource, payload);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The local half: scope, window, lifetime and epoch, none of which needs a
+ * network call or a key.
+ */
+interface AuthorityPayload {
+  e?: string;
+  s?: string[];
+  a?: boolean;
+  r?: string[];
+  w?: string[];
+  nbf?: number;
+  exp?: number;
+  ep?: number;
+  aud?: string;
+}
+
+/** The longest lease this relay honours, and so the maximum revocation delay. */
+const MAX_AUTHORITY_LIFE_MS = 15 * 60 * 1000;
+
+function readAuthority(credential: string): AuthorityPayload | null {
+  const parts = credential.split(".");
+  if (parts.length !== 3) return null;
+  const raw = fromBase64Url(parts[1]);
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(new TextDecoder().decode(raw)) as AuthorityPayload;
+    // A lease with no bounds is not a lease, and accepting one would make the
+    // published revocation delay a fiction.
+    if (!p.exp || !p.nbf) return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+async function admitAuthority(env: Env, d: DecisionRequest): Promise<Grant> {
+  const spec = (env.HELIOGRAPH_RELAY_LEASE_KEY ?? "").trim();
+  if (!spec) return { allow: false, reason: "authority-unverifiable" };
+  if (!(await verifyAuthority(spec, d.credential))) {
+    return { allow: false, reason: "authority-unverifiable" };
+  }
+  const p = readAuthority(d.credential);
+  if (!p) return { allow: false, reason: "authority-unverifiable" };
+
+  const now = Date.now();
+  const nbf = p.nbf! * 1000;
+  const exp = p.exp! * 1000;
+  // Longer than this relay will honour would quietly extend the revocation
+  // delay this product publishes as a number.
+  if (exp - nbf > MAX_AUTHORITY_LIFE_MS) return { allow: false, reason: "authority-expired" };
+  if (now < nbf || now >= exp) return { allow: false, reason: "authority-expired" };
+
+  const scope: Scope = {
+    estate: p.e ?? "",
+    stations: p.s ?? [],
+    allStations: p.a === true,
+    read: p.r ?? [],
+    write: p.w ?? [],
+  };
+  if (!scopePermits(scope, d)) return { allow: false, reason: "out-of-scope" };
+  return { allow: true, scope };
+}
+
 async function admit(env: Env, d: DecisionRequest): Promise<Grant> {
   if (looksLikeAuthority(d.credential)) {
-    return { allow: false, reason: "authority-unverifiable" };
+    const g = await admitAuthority(env, d);
+    // A lease used outside itself is a request for MORE authority, and more
+    // authority comes from the control plane or from nowhere. Everything else
+    // about a lease is answered here, with no network call.
+    if (g.allow || g.reason !== "out-of-scope") return g;
   }
   const apply = truthy(env.HELIOGRAPH_RELAY_HOSTED) ? hosted : (g: Grant) => g;
   const stations = (env.HELIOGRAPH_RELAY_STATIONS ?? "").trim();

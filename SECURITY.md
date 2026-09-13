@@ -72,9 +72,28 @@ The same policy, in full, is in
 ## What this server is, and what it is not
 
 The relay stores and forwards **opaque ciphertext** between a control and a
-station. It holds no keys, does no crypto, and never sees plaintext. That is the
-whole design, and the file that has to be true for it is small enough to read in
-one sitting: `relay.go` plus `server.go`.
+station. It holds **no private key**, never sees plaintext, and touches
+cryptography in exactly one place and in one direction: it **verifies**
+authorisation lease signatures and cannot produce one. That is the whole design,
+and the files that have to be true for it are small enough to read in one
+sitting: `relay.go`, `server.go` and `verify.go`.
+
+> **This section used to say the relay "holds no keys, does no crypto".** It is
+> corrected here rather than quietly edited, under the policy above.
+>
+> Which clock applies: **the second one, so no advisory and no deadline.** The
+> old sentence described the relay as doing *less* than it does, and nobody was
+> exposed by the gap. Verifying a signature with a public key adds no key worth
+> stealing, and the change was published with the reasoning before it shipped
+> ([heliograph-io/heliograph-cloud#75](https://github.com/dbhq-uk/heliograph-relay/blob/main/CONTRIBUTING.md)).
+>
+> What changed and why: an authorisation lease is minted by a control plane and
+> handed to a relay that has never seen it before, so honouring one means
+> checking a signature. Without that the relay would have to refuse every lease,
+> which would remove the control-plane outage protection from the hosted relay
+> almost every customer uses. HMAC was rejected: it is symmetric, so a relay able
+> to verify would be a relay able to **mint**, and that ends the claim rather
+> than narrowing the sentence.
 
 This matters more than usual, because the relay is the one component that a
 compromise would put in the middle of somebody's estate.
