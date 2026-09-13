@@ -17,22 +17,28 @@ import (
 	"github.com/dbhq-uk/heliograph-relay/conformance"
 )
 
-// The Go server must pass the contract. The Cloudflare Worker in edge/ runs the
-// same suite against `wrangler dev` in CI, so the two implementations cannot
-// drift without one of them going red.
-func TestGoServerPassesTheContract(t *testing.T) {
+func quietLog() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func estates() *relay.StaticAuth {
 	auth := relay.NewStaticAuth()
 	auth.SetControl("e1", "ctl")
 	auth.SetStation("e1", "stn")
 	auth.SetControl("e2", "other-ctl")
 	auth.SetStation("e2", "other-stn")
+	return auth
+}
 
+// The Go server must pass the contract. The Cloudflare Worker in edge/ runs the
+// same suite against `wrangler dev` in CI, so the two implementations cannot
+// drift without one of them going red.
+func TestGoServerPassesTheContract(t *testing.T) {
 	// Wrapped so that a lease is recognised and refused for being unverifiable
 	// rather than reported as a bad credential. Every relay does this; only the
 	// verifier differs, and there is none here.
 	srv := httptest.NewServer(relay.NewAuthorisingServer(relay.NewStore(),
-		&relay.AuthorityAuth{Inner: relay.FromAuth(auth)},
-		slog.New(slog.NewTextHandler(io.Discard, nil))).Routes())
+		&relay.AuthorityAuth{Inner: relay.FromAuth(estates())}, quietLog()).Routes())
 	t.Cleanup(srv.Close)
 
 	rs := conformance.Run(conformance.Target{
@@ -77,6 +83,66 @@ func TestTheGoServerPassesTheContractBehindARemoteAuthoriser(t *testing.T) {
 	})
 	if !conformance.Report(os.Stdout, "go server behind a remote authoriser", rs) {
 		t.Fatal("the Go server behind RemoteAuth does not satisfy the relay contract")
+	}
+}
+
+// swappable is one HTTP surface in front of a server that can be replaced
+// underneath it, so a restart can be forced without the base URL changing.
+type swappable struct {
+	mu sync.RWMutex
+	h  http.Handler
+}
+
+func (s *swappable) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	h := s.h
+	s.mu.RUnlock()
+	h.ServeHTTP(w, r)
+}
+
+func (s *swappable) swap(h http.Handler) {
+	s.mu.Lock()
+	s.h = h
+	s.mu.Unlock()
+}
+
+// And the durability half of the contract, which needs a way to lose the
+// server's memory without losing its address.
+//
+// The disruptor here throws the whole Store away and builds a new one over the
+// same spool directory, which is what a new process does. It is not a process
+// restart: CI runs the same suite against the real binary being killed and
+// restarted (scripts/restart-go-relay.sh), and against `wrangler dev` likewise.
+// This one runs in `go test`, on every commit, with no processes to manage.
+func TestGoServerPassesTheContractWhenDurable(t *testing.T) {
+	dir := t.TempDir()
+	front := &swappable{}
+	open := func() {
+		store := relay.NewStore()
+		if _, err := store.OpenSpool(dir); err != nil {
+			t.Fatalf("OpenSpool(%q): %v", dir, err)
+		}
+		// The same wrapper the other passes use: a lease is recognised and
+		// refused for being unverifiable rather than reported as a bad
+		// credential. Durability does not change that and must not skip it.
+		front.swap(relay.NewAuthorisingServer(store,
+			&relay.AuthorityAuth{Inner: relay.FromAuth(estates())}, quietLog()).Routes())
+	}
+	open()
+	srv := httptest.NewServer(front)
+	t.Cleanup(srv.Close)
+
+	rs := conformance.Run(conformance.Target{
+		BaseURL: srv.URL, Estate: "e1", Station: "st1",
+		Control: "ctl", StationTok: "stn",
+		OtherEstate: "e2", OtherControl: "other-ctl",
+		Disrupt: func() error {
+			open()
+			return nil
+		},
+	})
+	if !conformance.Report(os.Stdout, "go server, durable", rs) {
+		t.Fatal("the Go server does not satisfy the relay contract when given a spool")
 	}
 }
 

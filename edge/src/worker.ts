@@ -702,14 +702,22 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     // /health carries what a monitoring check has no other way to learn: the
-    // version answering, and the hash of the bundle answering. `ok` stays
-    // first and stays a boolean, because something out there is already
-    // looking for it.
+    // version answering, the hash of the bundle answering, and which storage
+    // guarantee this deployment gives. `ok` stays first and stays a boolean,
+    // because something out there is already looking for it.
+    //
+    // `durable` is always true here: the queue lives in Durable Object storage,
+    // so an accepted message survives the instance that accepted it. The Go
+    // server answers the same question with false when it has no spool. The field
+    // exists for the same reason the hash does - a published claim about storage
+    // was false for the implementation actually deployed, and nobody could tell
+    // by asking.
     if (url.pathname === "/health") {
       return json({
         ok: true,
         version: reportedVersion(env),
         hash: reportedHash(env),
+        durable: true,
       });
     }
 

@@ -23,10 +23,22 @@ RUN CGO_ENABLED=0 GOAMD64=v1 go build -trimpath -buildvcs=false \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /heliograph-relay ./cmd/heliograph-relay
 
+# The spool directory, made here because a scratch image has no shell to make it
+# later and no way to chown it at run time.
+#
+# It matters that this exists in the image even though nothing is stored in it:
+# Docker initialises an empty named volume from the image's directory, ownership
+# included. Without it the volume arrives owned by root, the relay runs as 65532,
+# and `-e HELIOGRAPH_RELAY_SPOOL=...` refuses to start with a permission error -
+# which is the correct refusal to an impossible request, and a terrible first
+# five minutes for a self-hoster following the README.
+RUN install -d -o 65532 -g 65532 /var/lib/heliograph-relay
+
 # scratch, not alpine. There is no shell, no package manager and nothing to
 # exec into: if this container is compromised, there is nothing in it to use.
 FROM scratch
 COPY --from=build /heliograph-relay /heliograph-relay
+COPY --from=build --chown=65532:65532 /var/lib/heliograph-relay /var/lib/heliograph-relay
 # Non-root by uid, since there is no /etc/passwd to name a user in.
 USER 65532:65532
 EXPOSE 8080

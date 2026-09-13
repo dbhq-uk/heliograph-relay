@@ -123,6 +123,7 @@ certificates would be a bigger thing to audit for no gain.
 | `HELIOGRAPH_RELAY_STATIONS` | `estate:station:role:credential`, comma separated. `role` is `control` or `station`. Per-station scope |
 | `HELIOGRAPH_RELAY_AUTHORISER` | a URL that answers authorisation decisions. When set, estates are that service's business and `HELIOGRAPH_RELAY_ESTATES` is not read |
 | `HELIOGRAPH_RELAY_HOSTED` | refuse any credential not scoped to named stations, including one that declines to say |
+| `HELIOGRAPH_RELAY_SPOOL` | directory for durable messages. Unset means a restart drops what has not been collected: see [Storage](#storage) |
 
 It **refuses to start** with none of the three configured. Starting and answering 401
 to everything looks exactly like a credential problem at the far end, and sends
@@ -496,13 +497,15 @@ The whole account, including the CLI's side of it, is at
 **Held only until collected, or seven days, whichever comes first.** Then
 deleted. Nothing is kept after either.
 
-**The two implementations differ in how they hold it, and that matters enough to
-state rather than average over:**
+**Both implementations can keep an accepted message across a restart. For the Go
+binary it is a deployment choice, and the difference is stated rather than
+averaged over:**
 
 | | how | what a restart does |
 |---|---|---|
 | **Worker + Durable Object** (`edge/`) | Durable Object storage, which is persistent | nothing. A message you were told was accepted is still there |
-| **Go binary** (this repository) | in memory | drops undelivered messages, which costs a re-run |
+| **Go binary** with `HELIOGRAPH_RELAY_SPOOL` | one file per message in that directory, written and flushed before the 202 | nothing, as long as the directory outlives the process |
+| **Go binary** without it | in memory | drops undelivered messages, which costs a re-run |
 
 The Worker is the one deployed at `heliograph-relay.dbhq.uk`, so the hosted
 relay **does write to disk** inside that window.
@@ -531,20 +534,77 @@ only for as long as it takes you to collect it, and then we delete it"** - which
 is a shorter window than most systems and, unlike the previous sentence, is
 actually kept.
 
+### Durable before acknowledged, which is the whole of it
+
+The order is the guarantee. The message is written and flushed, and only then does
+the sender get its 202. A message that could not be written is a message that was
+**not accepted**: the relay answers `503` and says so, rather than a 202 it knows
+it cannot honour. The refusal reaches the one side that still has a copy, which is
+the only side that can do anything.
+
+### Running the Go relay durably
+
+```bash
+docker run -p 8080:8080 \
+  -v heliograph-spool:/var/lib/heliograph-relay \
+  -e HELIOGRAPH_RELAY_SPOOL=/var/lib/heliograph-relay \
+  -e HELIOGRAPH_RELAY_ESTATES="payments:$CTL:$STN" \
+  ghcr.io/dbhq-uk/heliograph-relay:latest
+```
+
+**The volume is the durability.** Without `-v` the spool lives in the container's
+own filesystem, which a replacement discards: a spool that looks durable and is
+not, which is the exact class of claim this page has already been wrong about
+once. That is why the spool is opt-in rather than a default path.
+
+At startup it says which guarantee you have, and what it recovered:
+
+```json
+{"level":"INFO","msg":"durable","spool":"/var/lib/heliograph-relay","recovered":1,"bytes":7}
+{"level":"INFO","msg":"not durable","reason":"HELIOGRAPH_RELAY_SPOOL is unset, so a restart drops what has not been collected"}
+```
+
+A file in the spool that does not parse as a message is **moved aside** to
+`.corrupt` and named in the log at error level. Not deleted, because those bytes
+may be the only remaining copy of something; not fatal, because one unreadable
+file should not be an outage for every station on the relay.
+
+### What durability costs, measured rather than assumed
+
+| | |
+|---|---|
+| Go spool, per retained message | the body, plus **77 bytes** of header, plus filesystem block granularity. At 1 KiB, 64 KiB and 1 MiB of body: 1101, 65613 and 1048653 bytes on disk |
+| Go spool, per accepted message | one file created, one flush of it, one flush of the directory, inside the store's lock. A promise about power cuts that skips the flush is not one |
+| Durable Object, per retained message | about **1.34x the raw body**, with a floor of about 8 KiB. 1 KiB of body costs 8192 B, 64 KiB costs 94208 B, 512 KiB costs 704512 B |
+| Durable Object, per accepted message | one write of the **whole queue**. Put number n writes a value holding all n messages, so filling one queue to `DefaultMaxQueue` writes on the order of n squared bytes |
+
+Both rows are produced by tests rather than by arithmetic:
+[`TestASpooledMessageCostsTheBodyPlusASmallHeader`](spool_test.go) and
+[`edge/test/storage-cost.test.ts`](edge/test/storage-cost.test.ts), which print
+their figures on every run.
+
+The Durable Object numbers are measured against the local implementation
+(`wrangler dev --local`, which is miniflare's SQLite) and not against the
+platform's meter. The 1.33x is ours and transfers exactly - a body is stored in
+the base64 form it arrives in, and is never decoded - while the 8 KiB floor is
+SQLite page granularity and may differ on the platform.
+
 ### What is still outstanding
 
-- the Go binary is **not** durable, so a self-hoster running the container gets
-  the weaker guarantee. Making the two agree is open work
 - collection is destructive on acknowledgement rather than leased, so the window
   between the relay deleting and the collector durably storing is still a place a
   message can be lost. Leasing is open work
-- `conformance/` cannot assert any of this: it is asserted over HTTP, and the
-  storage model is not observable to a client. So storage claims are **not**
-  conformance-enforced, and each implementation asserts its own instead:
-  [`storage_test.go`](storage_test.go) for the Go server, and
-  [`edge/test/storage-model.test.ts`](edge/test/storage-model.test.ts) for the
-  Worker, which reads Durable Object storage directly because nothing over HTTP
-  can
+- the Worker stores one queue as one value, so a put rewrites every message
+  already queued. Correct, and more expensive than it needs to be
+- `conformance/` asserts **durability** for both implementations, because an
+  accepted message outliving a restart is observable as soon as the harness can
+  restart the relay (`conformance -restart`, and the scripts in
+  [`scripts/`](scripts)). It cannot assert the **storage model**: it is asserted
+  over HTTP, and memory and disk answer every request in it identically. So
+  storage claims are asserted per implementation instead, in
+  [`storage_test.go`](storage_test.go) and
+  [`edge/test/storage-model.test.ts`](edge/test/storage-model.test.ts), and a
+  conformance run says so in its own output
 
 ## API
 
