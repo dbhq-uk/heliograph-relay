@@ -48,6 +48,20 @@ costs, and let somebody decide. Hand-rolling a primitive in order to pass the
 grep is worse than importing one, because it evades the check rather than
 satisfying it.
 
+This has already cost something real, and the cost is recorded rather than
+absorbed. Authorisation leases (`authlease.go`) are signed, and **neither
+implementation can check the signature.** Ed25519 is the right primitive and is
+forbidden here. HMAC-SHA256 could be built from `crypto/sha256` alone and would
+pass the rule as written, and is refused twice over: a relay able to verify a
+symmetric MAC is a relay able to **mint** any lease it likes, which gives up
+"the relay holds no keys"; and hand-rolling it to get past the grep is the thing
+the paragraph above forbids.
+
+So the lease format, every local check and an `AuthorityVerifier` seam are
+published, the primitive is not chosen here, and a relay with no verifier
+refuses every lease. The options and their costs are written up on the issue.
+That is what "say so and let somebody decide" looks like in practice.
+
 ### One contract, every implementation
 
 There are two implementations: the Go server here and the Cloudflare Worker in

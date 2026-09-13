@@ -197,6 +197,8 @@ type Reason =
   | "queue-full"
   | "out-of-scope"
   | "estate-wide-credential"
+  | "authority-expired"
+  | "authority-unverifiable"
   | "internal";
 
 const STATUS: Record<Reason, number> = {
@@ -210,6 +212,8 @@ const STATUS: Record<Reason, number> = {
   "queue-full": 429,
   "out-of-scope": 401,
   "estate-wide-credential": 401,
+  "authority-expired": 401,
+  "authority-unverifiable": 401,
   internal: 500,
 };
 
@@ -225,6 +229,8 @@ const DETAIL: Record<Reason, string> = {
   "queue-full": "this queue is full: the recipient is not collecting",
   "out-of-scope": "this credential is not scoped to that station and direction",
   "estate-wide-credential": "this tenant refuses estate-wide credentials",
+  "authority-expired": "this authorisation lease is outside the window it was minted for",
+  "authority-unverifiable": "this authorisation lease could not be verified",
   internal: "could not accept the message",
 };
 
@@ -547,7 +553,37 @@ function truthy(v: string | undefined): boolean {
   return false;
 }
 
+/**
+ * An authorisation lease, which this implementation refuses.
+ *
+ * heliograph-io/heliograph-cloud#75 defines a bounded, scoped, signed grant the
+ * relay validates with no network call, so that a control-plane outage is not a
+ * transport outage. The Go server carries the format, every local check, and a
+ * seam an operator fills with a verifier.
+ *
+ * THIS IMPLEMENTATION CANNOT HAVE ONE. `.github/workflows/validate.yml` forbids
+ * cryptography at the edge outright, and verifying a signature is cryptography.
+ * Hand-rolling a primitive to get past the grep would evade that rule rather
+ * than satisfy it, which CONTRIBUTING.md says plainly.
+ *
+ * So a lease is RECOGNISED and REFUSED, with the reason a Go relay that has no
+ * verifier configured gives for the same credential. The two implementations
+ * agree about what happens; they disagree about what an operator can do next,
+ * and the README says so rather than averaging over it.
+ *
+ * The local checks are deliberately absent rather than written and unreachable.
+ * Validation that can never accept anything is validation nobody exercises, and
+ * it would read as support for a feature this implementation does not have.
+ */
+function looksLikeAuthority(credential: string): boolean {
+  const parts = credential.split(".");
+  return parts.length === 3 && parts[0] === "hl1" && parts[1] !== "";
+}
+
 async function admit(env: Env, d: DecisionRequest): Promise<Grant> {
+  if (looksLikeAuthority(d.credential)) {
+    return { allow: false, reason: "authority-unverifiable" };
+  }
   const apply = truthy(env.HELIOGRAPH_RELAY_HOSTED) ? hosted : (g: Grant) => g;
   const stations = (env.HELIOGRAPH_RELAY_STATIONS ?? "").trim();
   if (stations) return apply(admitScoped(stations, d));

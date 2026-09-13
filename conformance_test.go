@@ -27,7 +27,11 @@ func TestGoServerPassesTheContract(t *testing.T) {
 	auth.SetControl("e2", "other-ctl")
 	auth.SetStation("e2", "other-stn")
 
-	srv := httptest.NewServer(relay.NewServer(relay.NewStore(), auth,
+	// Wrapped so that a lease is recognised and refused for being unverifiable
+	// rather than reported as a bad credential. Every relay does this; only the
+	// verifier differs, and there is none here.
+	srv := httptest.NewServer(relay.NewAuthorisingServer(relay.NewStore(),
+		&relay.AuthorityAuth{Inner: relay.FromAuth(auth)},
 		slog.New(slog.NewTextHandler(io.Discard, nil))).Routes())
 	t.Cleanup(srv.Close)
 
@@ -59,7 +63,7 @@ func TestTheGoServerPassesTheContractBehindARemoteAuthoriser(t *testing.T) {
 	// refuses estate-wide credentials, and because that is the configuration
 	// the hosted service actually runs.
 	srv := httptest.NewServer(relay.NewAuthorisingServer(relay.NewStore(),
-		relay.Hosted{Inner: auth},
+		&relay.AuthorityAuth{Inner: relay.Hosted{Inner: auth}},
 		slog.New(slog.NewTextHandler(io.Discard, nil))).Routes())
 	t.Cleanup(srv.Close)
 

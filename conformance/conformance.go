@@ -498,6 +498,44 @@ func Run(t Target) []Result {
 			true, "")
 	}
 
+	// --- an authorisation lease nothing can verify -------------------------
+	// heliograph-io/heliograph-cloud#75. A lease is a bounded, scoped, signed
+	// grant a relay validates with no network call, so that a control-plane
+	// outage is not a transport outage.
+	//
+	// This is the half BOTH implementations can be held to, and it is the one
+	// that matters most if it is wrong: a relay with no verifier configured
+	// must refuse every lease rather than accept one. Accepting an unverified
+	// lease means accepting a forged one, and the forger chooses the scope.
+	//
+	// Neither implementation ships a verifier. The Go server publishes the seam
+	// and refuses until an operator fills it; the Worker cannot have one at all,
+	// because cryptography at the edge is forbidden. That difference is real and
+	// the README states it rather than averaging over it. What is asserted here
+	// is the behaviour they share.
+	{
+		// A syntactically valid lease, minted by nobody. The payload decodes to
+		// {"e":"e1","s":["st1"],"r":["c2s"],"w":["s2c"],"nbf":1,"exp":9999999999}
+		const forged = "hl1.eyJlIjoiZTEiLCJzIjpbInN0MSJdLCJyIjpbImMycyJdLCJ3IjpbInMyYyJdLCJuYmYiOjEsImV4cCI6OTk5OTk5OTk5OX0.bm90LWEtc2lnbmF0dXJl"
+
+		code, why, _ := t.putR(t.Estate, uniq+"-lease", "s2c", forged, 1, []byte("x"))
+		ok("a lease nothing can verify is refused", code != 202, fmt.Sprintf("got %d", code))
+		ok("and the refusal names the lease rather than the credential",
+			why.Reason == "authority-unverifiable",
+			fmt.Sprintf("reason=%q", why.Reason))
+
+		code, _, _ = t.take(t.Estate, uniq+"-lease", "c2s", forged)
+		ok("a lease nothing can verify cannot collect either", code != 200,
+			fmt.Sprintf("got %d", code))
+
+		// And something merely lease-shaped is not mistaken for one. A relay
+		// that read every dotted credential as a lease would refuse ordinary
+		// tokens that happen to contain a full stop.
+		code, _ = t.put(t.Estate, uniq+"-dotted", "c2s", t.Control, 1, []byte("x"))
+		ok("an ordinary credential is still not read as a lease", code == 202,
+			fmt.Sprintf("got %d", code))
+	}
+
 	// --- estates are isolated --------------------------------------------
 	if t.OtherEstate != "" {
 		code, _ = t.put(t.OtherEstate, uniq, "c2s", t.Control, 1, []byte("x"))
