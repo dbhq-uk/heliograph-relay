@@ -25,6 +25,27 @@ jobs:
       - run: go vet ./...
       - run: go test ./... -count=1 -race
 
+      - name: the contract against the real binary, across a real restart
+        # go test asserts durability by rebuilding the Store over the same spool,
+        # which is what a new process does but is not one. This kills the binary
+        # and starts it again, so the wiring in main.go is in the path too: a
+        # relay that forgets to open its spool passes the unit tests and fails
+        # here.
+        run: |
+          set -eu
+          go build -o ./heliograph-relay ./cmd/heliograph-relay
+          export HELIOGRAPH_RELAY_SPOOL=/tmp/spool
+          export HELIOGRAPH_RELAY_ADDR=:8097
+          export HELIOGRAPH_RELAY_ESTATES="e1:ctl:stn,e2:other-ctl:other-stn"
+          ./scripts/restart-go-relay.sh
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8097/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:8097/health || { cat /tmp/heliograph-relay.log; exit 1; }
+          go run ./cmd/conformance -restart ./scripts/restart-go-relay.sh \
+            http://localhost:8097 "go binary, durable"
+
       - name: no dependencies at all
         # This server has none and should never have any. It stores bytes and
         # moves them; anything it needed a library for would be something it
@@ -141,21 +162,28 @@ jobs:
         run: npm test
 
       - name: start the worker locally
-        working-directory: edge
+        # Through the same script the suite uses to restart it, so the thing
+        # under test and the thing that restarts it cannot disagree about how it
+        # is started.
         run: |
-          npx wrangler dev --port 8787 --local \
-            --var HELIOGRAPH_RELAY_ESTATES:"e1:ctl:stn,e2:other-ctl:other-stn" \
-            > /tmp/wrangler.log 2>&1 &
+          ./scripts/restart-worker.sh
           for i in $(seq 1 60); do
             curl -sf http://localhost:8787/health >/dev/null && break
             sleep 1
           done
           curl -sf http://localhost:8787/health || { cat /tmp/wrangler.log; exit 1; }
 
-      - name: the same conformance suite the Go server runs
+      - name: the same conformance suite the Go server runs, durability included
         # Two implementations, one contract. The cost of a second
         # implementation is drift, and drift is only dangerous when untested.
-        run: go run ./cmd/conformance http://localhost:8787 "cloudflare worker"
+        #
+        # -restart is what turns the durability assertions on: the suite cannot
+        # take a relay away from itself, so the harness supplies the mechanism.
+        # Without it those assertions report as skipped, which is visible in the
+        # output rather than silently absent.
+        run: |
+          go run ./cmd/conformance -restart ./scripts/restart-worker.sh \
+            http://localhost:8787 "cloudflare worker, durable"
 
       - name: start a second worker behind a remote authoriser
         # The seam the hosted service lives behind. A seam nobody has run the

@@ -36,6 +36,19 @@
 //
 // Report says so on every run, so a green result does not read as broader than
 // it is.
+//
+// # Durability is a different thing, and this suite does assert it
+//
+// Whether a message is written to disk is invisible here. Whether an accepted
+// message SURVIVES is not: it is exactly what a sender cares about, and it is
+// observable as soon as somebody can restart the relay between the put and the
+// take. The suite cannot do that itself - a suite able to restart its target
+// could be pointed at somebody's production relay - so Target.Disrupt is
+// supplied by the harness and the assertions live here.
+//
+// With no disruptor those assertions are reported as SKIPPED rather than quietly
+// omitted, because "this relay is durable" and "nobody asked" must not look the
+// same in the output.
 package conformance
 
 import (
@@ -92,6 +105,17 @@ type Target struct {
 	// recognisable pattern of bytes through, then look at every byte the
 	// authoriser was given and fail if the pattern is in there.
 	AuthoriserSaw func() []byte
+
+	// Disrupt loses whatever the relay was holding in memory and returns when it
+	// is answering again. Nil means the durability assertions are skipped and
+	// reported as skipped.
+	//
+	// The same reasoning as ControlPlane, for a different lever: no client can
+	// restart the relay it is talking to, and a suite that could would be a suite
+	// somebody eventually points at a production relay. So the caller supplies
+	// the mechanism and this package supplies the assertions - see
+	// cmd/conformance's -restart, and the scripts/ directory.
+	Disrupt Disrupt
 }
 
 // The tenancy this contract uses when a harness supplies one.
@@ -126,11 +150,20 @@ type refusal struct {
 	Reason string `json:"reason"`
 }
 
+// Disrupt makes the relay lose its in-memory state without touching whatever it
+// holds durably, and returns once it is serving again.
+type Disrupt func() error
+
 // Result is one assertion.
 type Result struct {
 	Name string
 	OK   bool
 	Why  string
+	// Skipped means it was not attempted, which is neither a pass nor a failure.
+	// It is a separate field rather than OK=true with a note, because a check
+	// that prints as a pass while asserting nothing is how a claim ends up with
+	// no test at all. Two of those have been found in heliograph already.
+	Skipped bool
 }
 
 func (t Target) client() *http.Client {
@@ -217,7 +250,7 @@ func Run(t Target) []Result {
 
 	// --- health ---------------------------------------------------------
 	//
-	// /health answers the two questions a monitoring check actually has, and
+	// /health answers the three questions a monitoring check actually has, and
 	// they are different questions. The VERSION is the commit a deployment
 	// believes it is, which is a claim it makes about itself. The HASH is of
 	// the artefact that is serving - the Worker bundle, or the binary on
@@ -225,6 +258,12 @@ func Run(t Target) []Result {
 	// building the same tag, which is the only form of "the relay in the path
 	// is the relay you read" that does not end in trusting whoever deployed
 	// it. See https://heliograph.dbhq.uk/provenance.
+	//
+	// DURABLE is the third, and it is the same kind of answer as the hash: it
+	// turns a documented promise into a value somebody can read. A published
+	// claim about storage was once false for the implementation actually
+	// deployed and nobody could tell by asking
+	// (heliograph-io/heliograph-cloud#47).
 	resp, hbody, err := t.do("GET", base+"/health", "", nil)
 	ok("health answers without a token", err == nil && resp != nil && resp.StatusCode == 200,
 		fmt.Sprintf("err=%v", err))
@@ -232,6 +271,11 @@ func Run(t Target) []Result {
 		OK      bool   `json:"ok"`
 		Version string `json:"version"`
 		Hash    string `json:"hash"`
+		// A pointer, because the assertion is that the field is PRESENT. Its
+		// value is a fact about the deployment rather than about the
+		// implementation, and either value is correct: a self-hoster with no
+		// spool configured is honestly not durable.
+		Durable *bool `json:"durable"`
 	}{}
 	healthParsed := err == nil && json.Unmarshal(hbody, &health) == nil
 	ok("health still says ok", healthParsed && health.OK,
@@ -243,6 +287,9 @@ func Run(t Target) []Result {
 		fmt.Sprintf("version=%q", health.Version))
 	ok("health names the hash of what is serving", healthParsed && health.Hash != "",
 		fmt.Sprintf("hash=%q", health.Hash))
+	ok("health says whether this deployment is durable",
+		healthParsed && health.Durable != nil,
+		fmt.Sprintf("body=%s", string(hbody)))
 
 	// --- identity, and the two endpoints a human reaches for -------------
 	// Both are unauthenticated on purpose. "The relay you are talking to is
@@ -608,18 +655,104 @@ func Run(t Target) []Result {
 	ok("wait=0 returns immediately rather than holding the line",
 		time.Since(start) < 5*time.Second, time.Since(start).String())
 
+	out = append(out, t.durability(uniq)...)
+	return out
+}
+
+// durability asserts that an accepted message outlives the relay that accepted
+// it, which is the one property a sender cannot verify for itself.
+//
+// A sender that receives a 202 and deletes its own copy has handed the relay the
+// only copy. On this transport the sender is frequently a station nobody can log
+// into, holding the only record of an hour-long capture, so "it costs a re-run"
+// is not always a cost that can be paid.
+//
+// Both implementations must satisfy it. The Worker persists to Durable Object
+// storage; the Go server persists to a spool directory when it has been given
+// one. Whether a particular deployment IS durable is a deployment choice, which
+// is why this needs a disruptor from the harness rather than asserting a storage
+// model it cannot see.
+func (t Target) durability(uniq string) []Result {
+	var out []Result
+	const (
+		survives  = "a message accepted before the relay restarts is still there after it"
+		notTwice  = "a message collected before the relay restarts does not come back after it"
+		cameBack  = "the relay answers again after being restarted"
+		accepted  = "a message is accepted before the relay is restarted"
+		skipWhy   = "no disruptor was supplied, so nothing here was attempted. See cmd/conformance -restart"
+		bodyMagic = "durable"
+	)
+	if t.Disrupt == nil {
+		// Named and marked skip rather than left out. A reader of this output has
+		// to be able to tell "this relay is durable" from "nobody asked".
+		return []Result{
+			{Name: survives, Skipped: true, Why: skipWhy},
+			{Name: notTwice, Skipped: true, Why: skipWhy},
+		}
+	}
+	ok := func(name string, cond bool, why string) {
+		out = append(out, Result{Name: name, OK: cond, Why: why})
+	}
+
+	station := uniq + "-durable"
+	want := []byte{0x00, 0xff, '\n', 'd', 'u', 'r', 'a', 'b', 'l', 'e', 0xfe}
+	code, err := t.put(t.Estate, station, "c2s", t.Control, 11, want)
+	ok(accepted, code == 202, fmt.Sprintf("got %d %v", code, err))
+	if code != 202 {
+		return out
+	}
+
+	if err := t.Disrupt(); err != nil {
+		ok(cameBack, false, err.Error())
+		return out
+	}
+	ok(cameBack, true, "")
+
+	code, got, err := t.take(t.Estate, station, "c2s", t.StationTok)
+	survived := code == 200 && len(got) == 1 && bytes.Equal(got[0].Body, want) && got[0].Seq == 11
+	ok(survives, survived, fmt.Sprintf("got %d, %d messages, %+v (err %v)", code, len(got), got, err))
+
+	// The other half, and the one that keeps durability from becoming a backup:
+	// what has been collected must not reappear. A durable copy that outlives
+	// collection is ciphertext the relay is still holding after it promised not
+	// to, and the recipient would be handed it twice.
+	second := uniq + "-collected"
+	if code, err := t.put(t.Estate, second, "c2s", t.Control, 12, []byte(bodyMagic)); code != 202 {
+		ok(notTwice, false, fmt.Sprintf("the second message was not accepted: %d %v", code, err))
+		return out
+	}
+	if _, got, _ := t.take(t.Estate, second, "c2s", t.StationTok); len(got) != 1 {
+		ok(notTwice, false, fmt.Sprintf("the second message did not come back at all: %d", len(got)))
+		return out
+	}
+	if err := t.Disrupt(); err != nil {
+		ok(notTwice, false, err.Error())
+		return out
+	}
+	_, got, _ = t.take(t.Estate, second, "c2s", t.StationTok)
+	ok(notTwice, len(got) == 0, fmt.Sprintf("it came back %d time(s) after collection", len(got)))
 	return out
 }
 
 // Report renders results, and says whether everything passed.
 func Report(w io.Writer, name string, rs []Result) bool {
 	fmt.Fprintf(w, "\n--- relay conformance: %s ---\n", name)
-	pass, fail := 0, 0
+	pass, fail, skip := 0, 0, 0
 	for _, r := range rs {
-		if r.OK {
+		switch {
+		case r.Skipped:
+			// Printed, and printed with its reason. A skipped assertion that
+			// leaves no trace is indistinguishable from one that was never
+			// written.
+			skip++
+			fmt.Fprintf(w, "skip %s\n", r.Name)
+			if r.Why != "" {
+				fmt.Fprintf(w, "     %s\n", r.Why)
+			}
+		case r.OK:
 			pass++
 			fmt.Fprintf(w, "ok   %s\n", r.Name)
-		} else {
+		default:
 			fail++
 			fmt.Fprintf(w, "FAIL %s\n", r.Name)
 			if r.Why != "" {
@@ -627,7 +760,7 @@ func Report(w io.Writer, name string, rs []Result) bool {
 			}
 		}
 	}
-	fmt.Fprintf(w, "\n%s: %d passed, %d failed\n", name, pass, fail)
+	fmt.Fprintf(w, "\n%s: %d passed, %d failed, %d skipped\n", name, pass, fail, skip)
 	// Printed on every run, pass or fail. A green suite would otherwise read as
 	// "the relay is correct" when what it means is "the relay behaves correctly
 	// over HTTP", and the difference is where the two implementations diverged.

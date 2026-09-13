@@ -7,11 +7,13 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"sync"
@@ -27,7 +29,23 @@ func envOr(k, def string) string {
 	return def
 }
 
-const usage = `usage: conformance <base-url> [name]
+// restart is a command that stops the relay and starts it again with whatever it
+// holds durably intact.
+//
+// The suite cannot do this itself, and should not be able to: a conformance
+// suite able to restart its target is a conformance suite somebody will
+// eventually point at a production relay. So the mechanism is the harness's, it
+// is named on the command line, and without it the durability assertions report
+// as skipped rather than as passed.
+var restart = flag.String("restart", "",
+	"shell command that restarts the relay, keeping its durable state.\n"+
+		"Supplying it enables the durability assertions; without it they are skipped.\n"+
+		"See scripts/restart-go-relay.sh and scripts/restart-worker.sh.")
+
+var health = flag.Duration("restart-timeout", 90*time.Second,
+	"how long to wait for /health after a restart")
+
+const usage = `usage: conformance [-restart <command>] <base-url> [name]
 
 expects estates e1 (ctl/stn) and e2 (other-ctl/other-stn)
 
@@ -43,13 +61,19 @@ expects estates e1 (ctl/stn) and e2 (other-ctl/other-stn)
 `
 
 func main() {
-	if len(os.Args) < 2 {
+	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	if flag.NArg() < 1 {
+		flag.Usage()
 		os.Exit(2)
 	}
+	base := flag.Arg(0)
 	name := "relay"
-	if len(os.Args) > 2 {
-		name = os.Args[2]
+	if flag.NArg() > 1 {
+		name = flag.Arg(1)
 	}
 	// Tokens from the environment, so the same suite can be pointed at a
 	// local wrangler, a container, or the hosted relay without editing it.
@@ -59,11 +83,15 @@ func main() {
 	stn2 := envOr("HELIOGRAPH_CONF_STATION2", "other-stn")
 
 	target := conformance.Target{
-		BaseURL: os.Args[1], Estate: "e1", Station: "st1",
+		BaseURL: base, Estate: "e1", Station: "st1",
 		Control: ctl, StationTok: stn,
 		OtherEstate: "e2", OtherControl: ctl2,
 	}
 
+	// Two levers, and neither belongs in the suite itself: one takes the
+	// authoriser away, one takes the whole relay away. Both are supplied here
+	// because the harness knows how this deployment is run and the contract
+	// deliberately does not.
 	if addr := os.Getenv("HELIOGRAPH_CONF_AUTHORISER"); addr != "" {
 		cp := &controlPlane{addr: addr, tokens: map[string][2]string{
 			"e1": {ctl, stn},
@@ -93,6 +121,9 @@ func main() {
 				time.Sleep(200 * time.Millisecond)
 			}
 		}
+	}
+	if *restart != "" {
+		target.Disrupt = restarter(base, *restart, *health)
 	}
 
 	rs := conformance.Run(target)
@@ -274,5 +305,36 @@ func stationScope(estate, station string, read, write []string) map[string]any {
 	return map[string]any{
 		"estate": estate, "stations": []string{station}, "allStations": false,
 		"read": read, "write": write,
+	}
+}
+
+// restarter runs the command and then waits for the relay to answer again.
+//
+// Waiting here rather than in the script means every harness waits the same way,
+// and a script that returns the moment it has forked does not turn into a
+// flaky durability failure.
+func restarter(base, command string, timeout time.Duration) conformance.Disrupt {
+	return func() error {
+		cmd := exec.Command("sh", "-c", command)
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("the restart command failed: %w", err)
+		}
+		client := &http.Client{Timeout: 5 * time.Second}
+		deadline := time.Now().Add(timeout)
+		for {
+			resp, err := client.Get(base + "/health")
+			if err == nil {
+				code := resp.StatusCode
+				_ = resp.Body.Close()
+				if code == http.StatusOK {
+					return nil
+				}
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("the relay did not answer /health within %s of the restart", timeout)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 }
