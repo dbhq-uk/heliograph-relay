@@ -94,6 +94,13 @@ destructive collection means a stolen token can cause silent loss rather than
 silent disclosure. Anybody reasoning about this should read that sentence with
 its qualifier attached.
 
+Leased collection does not change that, and it is worth being exact about why.
+A lease means a collector that **dies** loses nothing, because the messages come
+back when the lease expires. It is requested by the client, so a thief holding a
+stolen token simply does not request one and collects destructively exactly as
+before. The lease removes accidental loss, which is the common case; the
+deliberate case still needs the token not to be stolen.
+
 ### The two scopes are asymmetric on purpose
 
 A **station** token may read requests and write status and logs. A **control**
