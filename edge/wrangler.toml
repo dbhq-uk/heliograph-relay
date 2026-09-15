@@ -13,13 +13,33 @@ account_id = "691c21cdcf1b3fa4add70cc166e99733"
 # The hosted relay. Not a secret: an account id is an identifier, and this
 # deployment being public is a feature of a product whose claim is that the
 # relay cannot read your logs. Hiding how it is deployed would weaken that.
-routes = [{ pattern = "heliograph-relay.dbhq.uk", custom_domain = true }]
+routes = [
+  { pattern = "relay.heliograph.io", custom_domain = true },
+  { pattern = "heliograph-relay.dbhq.uk", custom_domain = true },
+]
 
-# THREE LABELS, NOT FOUR, AND THAT IS THE WHOLE REASON FOR THE NAME.
+# TWO HOSTNAMES, AND NEITHER REDIRECTS TO THE OTHER.
+#
+# `relay.heliograph.io` is the endpoint the documentation names. It exists
+# because `heliograph.io` is now a Cloudflare zone and the relay should answer
+# on the product's own domain rather than on the company's.
+#
+# `heliograph-relay.dbhq.uk` is kept **permanently**, not deprecated. A station
+# is configured with a `RELAY_URL` and that configuration lives on a machine
+# nobody can reach to change; that is the whole premise of the product. Any
+# station already pointed at it keeps working for as long as the relay does.
+#
+# **No 301 between them, ever.** The bash station's curl has no `-L`
+# (`station/bash/transports/relay.sh`), and Go's http client strips the
+# `Authorization` header across a host change. A redirect would look like a
+# tidy-up and would present as an authentication failure on somebody else's
+# machine.
+#
+# THREE LABELS, NOT FOUR, AND IT IS WHY BOTH NAMES LOOK LIKE THIS.
 #
 # `relay.heliograph.dbhq.uk` was the first choice and it cannot be given a
-# certificate on this plan. Cloudflare's Universal SSL covers `dbhq.uk` and
-# `*.dbhq.uk` - ONE level of subdomain. A four-label host needs an advanced
+# certificate on this plan. Cloudflare's Universal SSL covers a zone and
+# `*.zone` - ONE level of subdomain. A four-label host needs an advanced
 # certificate pack, and advanced packs require Advanced Certificate Manager,
 # which is a paid add-on. Without it the pack Cloudflare creates automatically
 # sits in `pending_validation` forever.
@@ -28,13 +48,21 @@ routes = [{ pattern = "heliograph-relay.dbhq.uk", custom_domain = true }]
 # TLS handshake error naming no certificate at all, which reads exactly like a
 # broken deployment when the deployment is fine.
 #
+# Both names here are three labels and both are covered by their zone's
+# Universal pack. `relay.heliograph.io` was checked rather than assumed:
+# `GET /zones/{zone}/ssl/certificate_packs?status=all` reports the universal
+# pack for `heliograph.io` and `*.heliograph.io` as `active`.
+#
+# **And read the pack that is `active`, not the first one that names the host.**
+# `wrangler deploy` with `custom_domain = true` also asks for an advanced pack
+# of its own, which on a plan without Advanced Certificate Manager stays in
+# `pending_validation` for ever. A zone therefore holds two packs covering one
+# host, disagreeing, and a check reading the first failed a working deployment
+# on 2026-09-14 (heliograph-cloud#215).
+#
 # Check it rather than guessing:
 #   GET /zones/{zone}/ssl/certificate_packs?status=all   -> status, and hosts
 #   GET /zones/{zone}                                    -> plan
-#
-# `heliograph-relay.dbhq.uk` is three labels, covered by Universal SSL, free,
-# and works immediately. The hostname is an API endpoint in a config file
-# rather than branding, so the prettier name was not worth a subscription.
 
 # Estate tokens are secrets, not vars. Set with:
 #   wrangler secret put HELIOGRAPH_RELAY_ESTATES
