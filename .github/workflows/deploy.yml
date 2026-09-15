@@ -91,18 +91,26 @@ jobs:
       # Deploying is not the same as having deployed. Cloudflare propagates,
       # and a green deploy step with the old code still answering is precisely
       # the drift this whole endpoint exists to catch.
+      # BOTH HOSTNAMES, because they are two custom domains on one script and
+      # a route that failed to attach is invisible from the other one. A
+      # station configured with either must reach the commit that was built.
       - name: prove the live relay is answering as this commit
         run: |
           want='${{ github.sha }}'
-          for i in $(seq 1 30); do
-            got="$(curl -fsS https://heliograph-relay.dbhq.uk/version \
-                    | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" || got=''
-            [ "$got" = "$want" ] && { echo "live version is $got"; exit 0; }
-            echo "attempt $i: live version is '${got:-unreachable}', want $want"
-            sleep 5
+          for host in relay.heliograph.io heliograph-relay.dbhq.uk; do
+            ok=''
+            for i in $(seq 1 30); do
+              got="$(curl -fsS "https://$host/version" \
+                      | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" || got=''
+              [ "$got" = "$want" ] && { echo "$host is $got"; ok=1; break; }
+              echo "attempt $i on $host: '${got:-unreachable}', want $want"
+              sleep 5
+            done
+            [ -n "$ok" ] || {
+              echo "::error::$host never reported $want. If the TLS handshake failed naming no certificate, read GET /zones/{zone}/ssl/certificate_packs?status=all and take the pack that is active rather than the first one naming the host."
+              exit 1
+            }
           done
-          echo "::error::the deploy reported success and the live relay never reported $want"
-          exit 1
 
       # AND THE HASH, which is the half a version string cannot give you.
       # Anybody can run edge/reproduce.sh against this tag and get this number;
@@ -113,20 +121,27 @@ jobs:
           set -euo pipefail
           want='${{ steps.bundle.outputs.sha256 }}'
           [ -n "$want" ] || { echo "::error::the bundle hash was never computed"; exit 1; }
-          for i in $(seq 1 30); do
-            got="$(curl -fsS https://heliograph-relay.dbhq.uk/health \
-                    | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p')" || got=''
-            [ "$got" = "$want" ] && { echo "live bundle hash is $got"; exit 0; }
-            echo "attempt $i: live hash is '${got:-unreachable}', want $want"
-            sleep 5
+          for host in relay.heliograph.io heliograph-relay.dbhq.uk; do
+            ok=''
+            for i in $(seq 1 30); do
+              got="$(curl -fsS "https://$host/health" \
+                      | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p')" || got=''
+              [ "$got" = "$want" ] && { echo "$host bundle hash is $got"; ok=1; break; }
+              echo "attempt $i on $host: '${got:-unreachable}', want $want"
+              sleep 5
+            done
+            [ -n "$ok" ] || {
+              echo "::error::$host never reported the bundle hash this deploy built"
+              exit 1
+            }
           done
-          echo "::error::the live relay never reported the bundle hash this deploy built"
-          exit 1
 
       - name: and that it still passes the contract in production
         # Read-only against the live service: /health, /, /version. The queue
         # checks need estate credentials and are deliberately not run here.
         run: |
-          curl -fsS https://heliograph-relay.dbhq.uk/health >/dev/null
-          curl -fsS -H 'Accept: text/html' https://heliograph-relay.dbhq.uk/ \
-            | grep -q '<title>heliograph relay</title>'
+          for host in relay.heliograph.io heliograph-relay.dbhq.uk; do
+            curl -fsS "https://$host/health" >/dev/null
+            curl -fsS -H 'Accept: text/html' "https://$host/" \
+              | grep -q '<title>heliograph relay</title>'
+          done

@@ -11,7 +11,7 @@
 #
 #     git clone --branch v0.1.0 https://github.com/dbhq-uk/heliograph-relay
 #     cd heliograph-relay && edge/reproduce.sh
-#     curl -s https://heliograph-relay.dbhq.uk/health
+#     curl -s https://relay.heliograph.io/health
 #
 #  Same hash, and the bundle serving your traffic is the source you just read.
 #  A different hash means the deployment is not this tag, and that is worth

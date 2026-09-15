@@ -476,12 +476,24 @@ to is the relay you read" is not checkable if you need a credential to ask which
 relay it is.
 
 ```bash
-curl https://heliograph-relay.dbhq.uk/version
+curl https://relay.heliograph.io/version
 {"service":"heliograph-relay","implementation":"worker","version":"<commit>",...}
 ```
 
 `GET /version` gives the service, which implementation is answering, the commit
-it was built from, and where the source is. `GET /` gives the same plus a
+it was built from, and where the source is.
+
+**Two hostnames answer, and neither redirects to the other.**
+`relay.heliograph.io` is the endpoint this documentation names.
+`heliograph-relay.dbhq.uk` is the older name and is kept **permanently** rather
+than deprecated: a station's `RELAY_URL` lives on a machine nobody can reach to
+change, which is the premise of this whole product, so a station already
+pointing at it keeps working for as long as the relay does.
+
+**There is deliberately no redirect between them.** The bash station's `curl`
+has no `-L`, and Go's HTTP client strips the `Authorization` header across a
+host change, so a 301 added as a tidy-up would present as an authentication
+failure on somebody else's machine. `GET /` gives the same plus a
 sentence on what this server is and a link to the documentation, because
 somebody who found the hostname in a config file and pasted it into a browser
 deserves better than a bare 404.
@@ -502,7 +514,7 @@ stops.
 serving it.**
 
 ```bash
-curl https://heliograph-relay.dbhq.uk/health
+curl https://relay.heliograph.io/health
 {"ok":true,"version":"<commit>","hash":"<sha256 of the worker bundle>"}
 ```
 
@@ -551,8 +563,8 @@ averaged over:**
 | **Go binary** with `HELIOGRAPH_RELAY_SPOOL` | one file per message in that directory, written and flushed before the 202 | nothing, as long as the directory outlives the process |
 | **Go binary** without it | in memory | drops undelivered messages, which costs a re-run |
 
-The Worker is the one deployed at `heliograph-relay.dbhq.uk`, so the hosted
-relay **does write to disk** inside that window.
+The Worker is the one deployed at `relay.heliograph.io`, so the hosted relay
+**does write to disk** inside that window.
 
 This documentation previously said "in memory ... never written to disk" of both,
 which was true of the Go binary and false of the Worker. That is corrected here
