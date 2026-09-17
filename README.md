@@ -776,3 +776,7 @@ including the `v0.1.0` and `v0.1.1` tags, stays available under MIT for ever.
 The CLI, station payloads, wire format and site are
 [heliograph](https://github.com/heliograph-io/heliograph), Apache 2.0. No shape
 is ever gated: beacon, flare and beam all work on a relay you host yourself.
+
+Full statement, including why fair source rather than AGPL and the honest limit
+of a two-year clock on a component this stable:
+**<https://docs.heliograph.io/licence>**
