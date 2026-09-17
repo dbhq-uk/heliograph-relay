@@ -1,0 +1,76 @@
+heliograph-relay
+Copyright (c) 2026 DBHQ Consulting Ltd
+
+Licensed under the Functional Source License, Version 1.1, ALv2 Future
+License (FSL-1.1-ALv2). See LICENSE.
+
+This is FAIR SOURCE, not open source. The source is published, you may read it,
+build it, modify it and run it, and each release becomes Apache 2.0 two years
+after it ships. What it does not permit is Competing Use. Calling it open
+source would be false.
+
+THE RELICENCE, AND WHAT IT DOES NOT TAKE AWAY
+---------------------------------------------
+
+This repository was published under the MIT licence until 2026-09-17. Every
+commit up to and including f664ea06f5b8859b2a15d283eb7e068565ed22dd is
+available under MIT, permanently, and nothing here withdraws that. The `v0.1.0`
+and `v0.1.1` tags are MIT and stay MIT. Anybody who wants an unrestricted relay
+can fork from there for ever.
+
+The relicence is unencumbered: `git shortlog -sne --all` on 2026-09-16 shows
+one author under two addresses. There is no third-party contributor whose
+permission was needed and not obtained.
+
+ADDITIONAL PERMISSION: PROFESSIONAL SERVICES
+--------------------------------------------
+
+The FSL's Permitted Purposes already include use "in connection with
+professional services that you provide to a licensee using the Software in
+accordance with these Terms and Conditions". That clause requires your client
+to be a licensee in their own right, which is narrower than what we intend, and
+a consultant should not have to read it twice.
+
+So, as the copyright holder, we additionally and irrevocably permit:
+
+  Deploying the relay to reach estates you or your clients operate, as part of
+  professional services you provide, provided you do not offer relay hosting
+  itself as a hosted or subscription service to third parties.
+
+Selling relay hosting IS Competing Use, because hosted relay is a tier we sell.
+Running a relay so that you can do a client's work is not, and never was meant
+to be.
+
+WHY FSL RATHER THAN AGPL, BSL OR MIT
+------------------------------------
+
+AGPL does not do this job and is banned in much of the market. Section 13 binds
+somebody hosting a MODIFIED copy; a competitor running this relay unmodified
+would owe nothing and could charge for it. AGPL is reciprocity, not protection
+against competing hosting. It is also prohibited outright at some of the
+organisations this is built for, and section 13 has no case law to lean on.
+
+BSL is the same shape as FSL with worse ergonomics: per-adopter parameters
+rather than one standard text, and a four-year clock rather than two.
+
+MIT protects nothing at all, which was fine while nothing was being sold.
+
+THE HONEST LIMIT, because it is specific to this component
+----------------------------------------------------------
+
+FSL's protection is worth what release velocity makes it worth - Sentry
+designed it that way, and it cuts badly here. This relay is DELIBERATELY
+stable. A two-year-old relay is still a good relay, so the conversion clock
+gives a competitor something useful. That is accepted rather than solved: by
+the time a competitor has a two-year-old beacon relay, the value has moved to
+the beam, the governance plane, and operating the thing.
+
+WHAT IS NOT UNDER THIS LICENCE
+------------------------------
+
+The heliograph CLI, station payloads, wire format and site are a separate
+repository under Apache 2.0: heliograph-io/heliograph. No shape is ever gated -
+beacon, flare and beam all work on a relay you host yourself.
+
+Heliograph Cloud is proprietary. The boundary between the three is documented
+at https://heliograph.io.

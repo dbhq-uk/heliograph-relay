@@ -197,6 +197,33 @@ found that, because every test that refuses also names a reason.
 - A commit message title is a sentence stating the finding, not a noun phrase,
   and the body says what changed and what it cost
 
+## Licence
+
+By contributing you agree your work is licensed under
+[FSL-1.1-ALv2](LICENSE), the same licence everybody else gets, including its
+grant of future Apache 2.0.
+
+Inbound equals outbound. There is no CLA and no copyright assignment: you keep
+your copyright. FSL has no copyleft, so nothing about keeping the hosted
+service private depends on taking your rights away.
+
+Sign your commits off with the [Developer Certificate of
+Origin](https://developercertificate.org/), which is `git commit -s` and adds
+one line:
+
+```
+Signed-off-by: Your Name <you@example.com>
+```
+
+That is a statement about provenance - that you wrote it, or have the right to
+submit it - and it is why no CLA is needed here.
+
+**Nothing currently enforces this.** No CI job checks for the trailer and no
+existing commit carries one, because until 2026-09-17 this repository had one
+contributor and a DCO between somebody and themselves is theatre. It is written
+down now because the relicence is the moment it starts to matter. The check
+goes in with the first outside pull request.
+
 ## Reporting a vulnerability
 
 Email rather than opening a public issue. See [SECURITY.md](SECURITY.md).

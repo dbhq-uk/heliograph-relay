@@ -4,7 +4,8 @@
 
 **Stores and forwards ciphertext it cannot read**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/License-FSL--1.1--ALv2-blue.svg)](LICENSE)
+[![Fair Source](https://img.shields.io/badge/fair-source-ff69b4.svg)](https://fair.io/)
 
 Part of [heliograph](https://github.com/heliograph-io/heliograph), by [DBHQ](https://dbhq.uk)
 
@@ -759,4 +760,19 @@ estates fails on exactly the estates this exists for.
 
 ## Licence
 
-[MIT](LICENSE) (c) 2026 DBHQ Consulting Ltd
+[FSL-1.1-ALv2](LICENSE) (c) 2026 DBHQ Consulting Ltd. **Fair source, not open
+source**: read it, build it, modify it, run it, and each release converts to
+Apache 2.0 two years after it ships. What it does not permit is competing use -
+selling relay hosting, which is a tier we sell.
+
+Deploying the relay to reach estates you or your clients operate, as part of
+professional services you provide, is expressly permitted. [`NOTICE`](NOTICE)
+carries that grant in full, along with why FSL rather than AGPL and the honest
+limit of a two-year clock on a component this stable.
+
+Relicensed from MIT on 2026-09-17. Every commit up to and including `f664ea0`,
+including the `v0.1.0` and `v0.1.1` tags, stays available under MIT for ever.
+
+The CLI, station payloads, wire format and site are
+[heliograph](https://github.com/heliograph-io/heliograph), Apache 2.0. No shape
+is ever gated: beacon, flare and beam all work on a relay you host yourself.
