@@ -1,0 +1,130 @@
+name: Release
+
+# Publishes `ghcr.io/heliograph-io/heliograph-relay` on a `v*` tag.
+#
+# WHY THIS FILE EXISTS. `README.md` has told a self-hoster to
+# `docker run ghcr.io/heliograph-io/heliograph-relay:latest` for as long as it
+# has existed, and NOTHING IN THIS REPOSITORY BUILT THAT IMAGE.
+# `validate.yml` builds it on every pull request and throws it away.
+# heliograph-cloud#266.
+#
+# That is the worst possible defect on this particular component. The relay's
+# whole claim is that you can run it yourself rather than trust the hosted one,
+# and the audience for that README is somebody who has already decided not to
+# use ours. Handing them a pull command that 404s is the first step of the path
+# we most want to work.
+#
+# DELIBERATELY NARROW. This publishes the container and nothing else. The Go
+# binary's own release, checksums and signing belong with the reproducible
+# build work and are not smuggled in here: a workflow that grows a second
+# purpose in its first week never gets read again.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Publish the container image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # For the build provenance attestation, which is what lets somebody
+      # establish which workflow and which commit produced the image.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The tests run again here, at the tag, rather than trusting a green tick
+      # from `validate.yml`. Those are separate runs on separate triggers, so a
+      # release that trusts one publishes whatever was merged while that run
+      # was still queued.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27.1'
+      - name: Tests must pass before anything is published
+        run: go test ./... -count=1
+
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # VERSION is passed because the Dockerfile stamps it into the binary, and
+      # `/health` reports it. An image that cannot say which tag it is defeats
+      # the reason /health carries a version at all.
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: |
+            ghcr.io/heliograph-io/heliograph-relay:${{ github.ref_name }}
+            ghcr.io/heliograph-io/heliograph-relay:latest
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ghcr.io/heliograph-io/heliograph-relay
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: It starts and answers /health
+        # The README's first instruction is `docker run`. Publishing an image
+        # that starts and then does nothing useful would make that a lie in a
+        # more expensive way than not publishing at all.
+        run: |
+          set -euo pipefail
+          CTL=$(head -c 32 /dev/urandom | base64)
+          STN=$(head -c 32 /dev/urandom | base64)
+          docker run -d --name relay-smoke -p 8080:8080 \
+            -e HELIOGRAPH_RELAY_ESTATES="payments:${CTL}:${STN}" \
+            "ghcr.io/heliograph-io/heliograph-relay:${GITHUB_REF_NAME}"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/tmp/health.json 2>/dev/null; then break; fi
+            sleep 2
+          done
+          cat /tmp/health.json
+          docker logs relay-smoke || true
+          docker rm -f relay-smoke >/dev/null
+          grep -q "${GITHUB_REF_NAME#v}" /tmp/health.json || {
+            echo "::error::the published image's /health does not report ${GITHUB_REF_NAME}"; exit 1; }
+          echo "the published image starts and reports its version"
+
+      - name: A STRANGER can pull it, which the step above does not prove
+        # The smoke test above runs `docker run` on a runner that is still
+        # logged in from docker/login-action, so it passes just as happily on a
+        # PRIVATE package - and private is the default for a container GitHub
+        # Packages has not seen before.
+        #
+        # heliograph learned this the expensive way on 2026-09-17: its first
+        # release under the new organisation pushed an image nothing could
+        # pull, and every documented `docker run` 404ed for everybody but us.
+        # The org-wide setting is the usual cause and its own settings page
+        # cannot fix it, so the error says where to go.
+        run: |
+          set -euo pipefail
+          img="heliograph-io/heliograph-relay"
+          tok="$(curl -sS "https://ghcr.io/token?scope=repository:${img}:pull&service=ghcr.io" | jq -r '.token // empty')"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${tok}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/${img}/manifests/${GITHUB_REF_NAME}")"
+          if [ "$code" != "200" ]; then
+            echo "::error::ghcr.io/${img}:${GITHUB_REF_NAME} is not anonymously pullable (HTTP ${code}). The README tells a self-hoster to docker run this, and it would 404 for all of them. Make it public at https://github.com/organizations/heliograph-io/settings/packages - Package creation, tick Public. NOT the package's own settings page: that greys Public out when the org forbids public packages. Neither setting has a REST endpoint."
+            exit 1
+          fi
+          echo "anonymous pull of ghcr.io/${img}:${GITHUB_REF_NAME} returns 200"
