@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	relay "github.com/dbhq-uk/heliograph-relay"
-	"github.com/dbhq-uk/heliograph-relay/conformance"
+	relay "github.com/heliograph-io/heliograph-relay"
+	"github.com/heliograph-io/heliograph-relay/conformance"
 )
 
 func quietLog() *slog.Logger {

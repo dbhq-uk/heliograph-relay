@@ -1,3 +1,3 @@
-module github.com/dbhq-uk/heliograph-relay
+module github.com/heliograph-io/heliograph-relay
 
 go 1.27.1

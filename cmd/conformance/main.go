@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dbhq-uk/heliograph-relay/conformance"
+	"github.com/heliograph-io/heliograph-relay/conformance"
 )
 
 func envOr(k, def string) string {

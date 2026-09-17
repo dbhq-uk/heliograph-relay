@@ -83,7 +83,7 @@ export interface Env {
 const WHAT_IT_IS =
   "Stores and forwards opaque ciphertext between a control and a station. " +
   "It holds no keys, does no crypto, and never sees plaintext.";
-const SOURCE_URL = "https://github.com/dbhq-uk/heliograph-relay";
+const SOURCE_URL = "https://github.com/heliograph-io/heliograph-relay";
 const DOCS_URL = "https://heliograph.dbhq.uk/relay";
 
 // A browser asking for / must get a page, not a download prompt. Returning

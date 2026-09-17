@@ -64,10 +64,10 @@ Go binary and false of the Worker that is actually deployed, and that Worker was
 persisting every message so that an accepted one could not be lost. The second
 clock applied: the correction states the old sentence, why it was wrong, and
 what each implementation does now
-([#1](https://github.com/dbhq-uk/heliograph-relay/pull/1)).
+([#1](https://github.com/heliograph-io/heliograph-relay/pull/1)).
 
 The same policy, in full, is in
-[heliograph's `SECURITY.md`](https://github.com/dbhq-uk/heliograph/blob/main/SECURITY.md).
+[heliograph's `SECURITY.md`](https://github.com/heliograph-io/heliograph/blob/main/SECURITY.md).
 
 ## What this server is, and what it is not
 
@@ -85,7 +85,7 @@ sitting: `relay.go`, `server.go` and `verify.go`.
 > old sentence described the relay as doing *less* than it does, and nobody was
 > exposed by the gap. Verifying a signature with a public key adds no key worth
 > stealing, and the change was published with the reasoning before it shipped
-> ([heliograph-io/heliograph-cloud#75](https://github.com/dbhq-uk/heliograph-relay/blob/main/CONTRIBUTING.md)).
+> ([heliograph-io/heliograph-cloud#75](https://github.com/heliograph-io/heliograph-relay/blob/main/CONTRIBUTING.md)).
 >
 > What changed and why: an authorisation lease is minted by a control plane and
 > handed to a relay that has never seen it before, so honouring one means
