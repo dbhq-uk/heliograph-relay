@@ -21,7 +21,7 @@ import (
 	"syscall"
 	"time"
 
-	relay "github.com/dbhq-uk/heliograph-relay"
+	relay "github.com/heliograph-io/heliograph-relay"
 )
 
 var version = "dev"

@@ -4,9 +4,10 @@
 
 **Stores and forwards ciphertext it cannot read**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/License-FSL--1.1--ALv2-blue.svg)](LICENSE)
+[![Fair Source](https://img.shields.io/badge/fair-source-ff69b4.svg)](https://fair.io/)
 
-Part of [heliograph](https://github.com/dbhq-uk/heliograph), by [DBHQ](https://dbhq.uk)
+Part of [heliograph](https://github.com/heliograph-io/heliograph), by [DBHQ](https://dbhq.uk)
 
 </div>
 
@@ -14,7 +15,7 @@ Part of [heliograph](https://github.com/dbhq-uk/heliograph), by [DBHQ](https://d
 
 ## What this is
 
-The relay for [heliograph](https://github.com/dbhq-uk/heliograph): a queue that
+The relay for [heliograph](https://github.com/heliograph-io/heliograph): a queue that
 lets a control and a station reach each other when neither can reach the other
 directly. Both sides dial **out** over ordinary HTTPS, so an estate needs no git
 host, no storage account, no VNet and no inbound firewall rule.
@@ -120,7 +121,7 @@ STN=$(head -c 32 /dev/urandom | base64)
 
 docker run -p 8080:8080 \
   -e HELIOGRAPH_RELAY_ESTATES="payments:$CTL:$STN" \
-  ghcr.io/dbhq-uk/heliograph-relay:latest
+  ghcr.io/heliograph-io/heliograph-relay:latest
 ```
 
 Or from source:
@@ -521,7 +522,7 @@ curl https://relay.heliograph.io/health
 That second number is one you can arrive at yourself, without asking us:
 
 ```bash
-git clone --branch <the tag> https://github.com/dbhq-uk/heliograph-relay
+git clone --branch <the tag> https://github.com/heliograph-io/heliograph-relay
 cd heliograph-relay && edge/reproduce.sh
 ```
 
@@ -605,7 +606,7 @@ docker run -p 8080:8080 \
   -v heliograph-spool:/var/lib/heliograph-relay \
   -e HELIOGRAPH_RELAY_SPOOL=/var/lib/heliograph-relay \
   -e HELIOGRAPH_RELAY_ESTATES="payments:$CTL:$STN" \
-  ghcr.io/dbhq-uk/heliograph-relay:latest
+  ghcr.io/heliograph-io/heliograph-relay:latest
 ```
 
 **The volume is the durability.** Without `-v` the spool lives in the container's
@@ -651,7 +652,7 @@ SQLite page granularity and may differ on the platform.
   already queued. Correct, and more expensive than it needs to be
 - the CLI and the station still collect without a lease, so the loss window is
   closed in the relay and not yet in the collector. Leasing is opt-in and the
-  client side of it is work in `dbhq-uk/heliograph` rather than here
+  client side of it is work in `heliograph-io/heliograph` rather than here
 - `conformance/` asserts **durability** for both implementations, because an
   accepted message outliving a restart is observable as soon as the harness can
   restart the relay (`conformance -restart`, and the scripts in
@@ -759,4 +760,19 @@ estates fails on exactly the estates this exists for.
 
 ## Licence
 
-[MIT](LICENSE) (c) 2026 DBHQ Consulting Ltd
+[FSL-1.1-ALv2](LICENSE) (c) 2026 DBHQ Consulting Ltd. **Fair source, not open
+source**: read it, build it, modify it, run it, and each release converts to
+Apache 2.0 two years after it ships. What it does not permit is competing use -
+selling relay hosting, which is a tier we sell.
+
+Deploying the relay to reach estates you or your clients operate, as part of
+professional services you provide, is expressly permitted. [`NOTICE`](NOTICE)
+carries that grant in full, along with why FSL rather than AGPL and the honest
+limit of a two-year clock on a component this stable.
+
+Relicensed from MIT on 2026-09-17. Every commit up to and including `f664ea0`,
+including the `v0.1.0` and `v0.1.1` tags, stays available under MIT for ever.
+
+The CLI, station payloads, wire format and site are
+[heliograph](https://github.com/heliograph-io/heliograph), Apache 2.0. No shape
+is ever gated: beacon, flare and beam all work on a relay you host yourself.

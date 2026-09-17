@@ -272,7 +272,7 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 
 const (
 	whatItIs  = "Stores and forwards opaque ciphertext between a control and a station. It holds no keys, does no crypto, and never sees plaintext."
-	sourceURL = "https://github.com/dbhq-uk/heliograph-relay"
+	sourceURL = "https://github.com/heliograph-io/heliograph-relay"
 	docsURL   = "https://heliograph.dbhq.uk/relay"
 
 	// The page a person lands on gets the short form. The full description is

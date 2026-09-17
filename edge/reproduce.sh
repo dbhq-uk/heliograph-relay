@@ -9,7 +9,7 @@
 #  deployed Worker reports at /health as `hash`. So the check a stranger makes
 #  is a real comparison rather than a restatement:
 #
-#     git clone --branch v0.1.0 https://github.com/dbhq-uk/heliograph-relay
+#     git clone --branch v0.1.0 https://github.com/heliograph-io/heliograph-relay
 #     cd heliograph-relay && edge/reproduce.sh
 #     curl -s https://relay.heliograph.io/health
 #
